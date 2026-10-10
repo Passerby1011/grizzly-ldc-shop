@@ -1,0 +1,145 @@
+// Grizzly 余额分销站 · 数据模型
+// 账本铁律：余额只走原子条件更新，绝不先读后写。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// LDC 支付订单（买家付积分买卡密）
+model Order {
+  id         String    @id @default(cuid())
+  outTradeNo String    @unique
+  ldcTradeNo String?
+  gateway    String    @default("epay") // epay | ldcpay
+  name       String
+  amountLdc  Decimal   @db.Decimal(18, 2)
+  faceUsd    Decimal   @db.Decimal(12, 4)
+  status     String    @default("pending") // pending | paid | expired | refunded | failed
+  rawNotify  Json?
+  paidAt     DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  keyId String?   @unique
+  key   CardKey?  @relation(fields: [keyId], references: [id])
+
+  @@index([status, createdAt])
+}
+
+/// 卡密：面值美元，余额被站点账本"预留锁定"
+model CardKey {
+  id         String    @id @default(cuid())
+  codeHash   String    @unique // sha256(明文)，明文只展示一次
+  codePrefix String // 展示用前缀
+  faceUsd    Decimal   @db.Decimal(12, 4)
+  balanceUsd Decimal   @db.Decimal(12, 4)
+  status     String    @default("active") // active | depleted | revoked | expired
+  expiresAt  DateTime?
+  note       String?
+  createdAt  DateTime  @default(now())
+
+  order       Order?
+  ledger      KeyLedger[]
+  activations Activation[]
+
+  @@index([status, createdAt])
+}
+
+/// 卡密余额流水（审计用，每笔变动一条）
+model KeyLedger {
+  id           String   @id @default(cuid())
+  keyId        String
+  deltaUsd     Decimal  @db.Decimal(12, 4) // 负=扣费，正=回补
+  balanceAfter Decimal  @db.Decimal(12, 4)
+  reason       String // reserve | get_number | adjust_reserve | cancel_refund | manual | expire
+  refId        String?
+  createdAt    DateTime @default(now())
+
+  key CardKey @relation(fields: [keyId], references: [id])
+
+  @@index([keyId, createdAt])
+}
+
+/// 单次接码激活记录
+model Activation {
+  id          String    @id @default(cuid())
+  keyId       String
+  grizzlyId   String    @unique
+  service     String
+  country     String
+  phone       String
+  reservedUsd Decimal   @db.Decimal(12, 4)
+  costUsd     Decimal?  @db.Decimal(12, 4)
+  status      String    @default("waiting") // waiting | ok | cancelled | expired
+  code        String?
+  smsText     String?
+  lastPolledAt DateTime?
+  createdAt   DateTime  @default(now())
+  closedAt    DateTime?
+
+  key CardKey @relation(fields: [keyId], references: [id])
+
+  @@index([keyId, status])
+  @@index([status, createdAt])
+}
+
+/// 池预留：已售未消耗的美元总额（"锁定"的落地凭据）
+model PoolReservation {
+  id        String   @id @default(cuid())
+  keyId     String   @unique
+  faceUsd   Decimal  @db.Decimal(12, 4)
+  released  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  releasedAt DateTime?
+}
+
+/// Grizzly 真实余额快照（对账用）
+model GrizzlySnapshot {
+  id               String   @id @default(cuid())
+  realBalanceUsd   Decimal  @db.Decimal(14, 4)
+  allocatedUsd     Decimal  @db.Decimal(14, 4)
+  availableUsd     Decimal  @db.Decimal(14, 4)
+  activeCount      Int      @default(0)
+  createdAt        DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/// 对账运行记录
+model ReconcileRun {
+  id         String   @id @default(cuid())
+  ok         Boolean
+  ledgerUsd  Decimal  @db.Decimal(14, 4)
+  realUsd    Decimal  @db.Decimal(14, 4)
+  driftUsd   Decimal  @db.Decimal(14, 4)
+  message    String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/// 幂等键（支付回调、外部动作）
+model IdempotencyKey {
+  key       String   @id
+  scope     String
+  createdAt DateTime @default(now())
+
+  @@index([scope, createdAt])
+}
+
+/// 价格缓存：上游价格接口不可用时由真实成交成本回填
+model PriceCache {
+  id        String   @id @default(cuid())
+  service   String
+  country   String
+  costUsd   Decimal  @db.Decimal(12, 4)
+  source    String   @default("observed") // observed | manual | api
+  updatedAt DateTime @updatedAt
+
+  @@unique([service, country])
+}

@@ -1,0 +1,3 @@
+#!/bin/sh
+# 提交前密钥扫描。安装：git config core.hooksPath .githooks
+node scripts/check-secrets.mjs || exit 1
