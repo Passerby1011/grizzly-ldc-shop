@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { displayCountryName, displayServiceName } from "@/lib/service-names.zh";
+import { displayCountryName, displayServiceName, hasChineseName } from "@/lib/service-names.zh";
 import { ApiCallError, apiGet, apiPost, errorMessage } from "./_api";
 import type {
   ActivationView,
@@ -16,6 +16,12 @@ import type {
 
 /** 接码台轮询间隔：每 4 秒问一次上游状态。 */
 const POLL_INTERVAL_MS = 4000;
+
+/**
+ * 常用国家置顶，避免 206 项从头翻。
+ * 这些 ID 来自上游 getCountries 实测（美国 187、英国 16、中国 3…）。
+ */
+const PINNED_COUNTRY_IDS = [187, 16, 3, 182, 45, 43, 78, 22, 6, 10, 4, 7, 52, 73, 14, 55];
 
 /** 国家 + 服务都选好后，自动估价的防抖等待。 */
 const QUOTE_DEBOUNCE_MS = 400;
@@ -50,6 +56,7 @@ export default function ShopPage() {
   const [orderError, setOrderError] = useState<string | null>(null);
 
   const [countries, setCountries] = useState<CountryView[]>([]);
+  const [countryFilter, setCountryFilter] = useState("");
   const [services, setServices] = useState<ServiceView[]>([]);
   const [country, setCountry] = useState("");
   const [service, setService] = useState("");
@@ -198,8 +205,35 @@ export default function ShopPage() {
   /* 倒计时未归零（或还没拿到服务端数据）时，取消按钮一律禁用 */
   const cancelPending = cancelLeft === null || cancelLeft > 0;
 
+  /** 国家列表：按中文名搜索 + 常用国家置顶，避免 206 项要翻半天。 */
+  const filteredCountries = useMemo(() => {
+    const needle = countryFilter.trim().toLowerCase();
+    const list = needle
+      ? countries.filter(
+          (item) =>
+            (item.name ?? "").toLowerCase().includes(needle) ||
+            item.eng.toLowerCase().includes(needle) ||
+            (item.chn ?? "").toLowerCase().includes(needle) ||
+            String(item.id) === needle,
+        )
+      : countries;
+
+    /* 常用国家置顶（其余保持服务端的中文排序） */
+    const pinned = new Set(PINNED_COUNTRY_IDS);
+    return [...list].sort((a, b) => {
+      const pa = pinned.has(a.id) ? 0 : 1;
+      const pb = pinned.has(b.id) ? 0 : 1;
+      return pa - pb;
+    });
+  }, [countries, countryFilter]);
+
   const filteredServices = useMemo(() => {
     const needle = serviceFilter.trim().toLowerCase();
+    /*
+     * 无关键字时只列「有中文名」的服务（约 80 个）。
+     * 上游 2488 个服务绝大多数是冷门英文品牌（Agroinform、Ahoy…），
+     * 默认铺满英文列表既看不懂也找不到目标；要什么直接搜，搜索覆盖全部。
+     */
     const list = needle
       ? services.filter((item) => {
           const zh = displayServiceName(item.code, item.name).toLowerCase();
@@ -209,7 +243,7 @@ export default function ShopPage() {
             zh.includes(needle)
           );
         })
-      : services;
+      : services.filter((item) => hasChineseName(item.code, item.name));
     /* 上游返回顺序每次都被打乱，展示前按展示名做确定性排序 */
     return [...list]
       .sort((a, b) => {
@@ -337,16 +371,36 @@ export default function ShopPage() {
       ) : null}
 
       {order ? (
-        <section className="card space-y-2 border-indigo-900 bg-indigo-950/30">
-          <h2 className="text-sm font-semibold text-indigo-200">
+        <section
+          className="card space-y-2"
+          style={{
+            borderColor: "rgb(var(--brand) / 0.35)",
+            background: "rgb(var(--brand) / 0.06)",
+          }}
+        >
+          <h2 className="text-sm font-semibold" style={{ color: "rgb(var(--brand))" }}>
             订单 {order.outTradeNo} · 面值 ${order.faceUsd} · {order.amountLdc} LDC · {order.status}
           </h2>
           {order.code ? (
-            <div className="space-y-1">
-              <p className="text-xs text-amber-300">卡密明文只在此窗口内展示，请立即保存（丢失无法找回）。</p>
-              <code className="block select-all rounded-lg bg-slate-950 px-3 py-2 font-mono text-lg tracking-wider">
-                {order.code}
-              </code>
+            <div className="space-y-2">
+              <p className="text-xs" style={{ color: "rgb(var(--warn))" }}>
+                卡密明文只在此窗口内展示，请立即保存（丢失无法找回）。
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <code
+                  className="code-display select-all text-lg"
+                  style={{ color: "rgb(var(--fg))" }}
+                >
+                  {order.code}
+                </code>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => void copyCode(order.code as string)}
+                >
+                  {copied ? "已复制 ✓" : "复制"}
+                </button>
+              </div>
             </div>
           ) : order.codeExpired ? (
             <p className="muted">明文展示窗口已过，只剩前缀 {order.codePrefix}。如有疑问请联系卖家并提供订单号。</p>
@@ -423,20 +477,33 @@ export default function ShopPage() {
             </h2>
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
-                <label className="label" htmlFor="country">
-                  国家
+                <label className="label" htmlFor="countryFilter">
+                  国家（可搜索，{countries.length} 个）
                 </label>
+                <input
+                  id="countryFilter"
+                  className="input mb-2"
+                  placeholder="例如 美国 / 英国 / usa"
+                  value={countryFilter}
+                  onChange={(event) => setCountryFilter(event.target.value)}
+                />
                 <select
                   id="country"
                   className="input"
+                  size={8}
                   value={country}
+                  aria-label="国家"
                   onChange={(event) => {
                     setCountry(event.target.value);
                     setQuote(null);
                   }}
                 >
-                  <option value="">请选择…</option>
-                  {countries.map((item) => (
+                  {country && !filteredCountries.some((c) => String(c.id) === country) ? (
+                    <option value={country}>
+                      {(countries.find((c) => String(c.id) === country)?.name ?? country) + `（#${country}）`}
+                    </option>
+                  ) : null}
+                  {filteredCountries.map((item) => (
                     <option key={item.id} value={String(item.id)}>
                       {item.name ?? displayCountryName(item.eng, item.chn)}（#{item.id}）
                     </option>
@@ -456,7 +523,7 @@ export default function ShopPage() {
                 />
                 <select
                   className="input"
-                  size={5}
+                  size={8}
                   value={service}
                   aria-label="服务"
                   onChange={(event) => {
@@ -464,6 +531,11 @@ export default function ShopPage() {
                     setQuote(null);
                   }}
                 >
+                  {service && !filteredServices.some((s) => s.code === service) ? (
+                    <option value={service}>
+                      {(services.find((s) => s.code === service)?.name ?? service) + `（${service}）`}
+                    </option>
+                  ) : null}
                   {filteredServices.map((item) => (
                     <option key={item.code} value={item.code}>
                       {displayServiceName(item.code, item.name)}（{item.code}）

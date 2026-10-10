@@ -119,6 +119,17 @@ export function displayCountryName(eng: string, chn?: string): string {
  *   4. 再兜底返回 code
  * 绝不返回空串或 "undefined"。
  */
+/**
+ * 该服务是否有中文名（本地词典命中，或上游自带中文）。
+ *
+ * 用途：接码台「不搜索时默认只列有中文名的服务」。
+ * 上游 2488 个服务绝大多数是冷门英文品牌（Agroinform、Ahoy…），
+ * 默认铺满英文列表既看不懂也找不到目标；要什么直接搜，搜索覆盖全部。
+ */
+export function hasChineseName(code: string, upstreamName: string): boolean {
+  return CJK_PATTERN.test(displayServiceName(code, upstreamName));
+}
+
 export function displayServiceName(code: string, upstreamName: string): string {
   const key = typeof code === "string" ? code.trim() : "";
   const zh = SERVICE_NAMES_ZH[key] ?? SERVICE_NAMES_ZH[key.toLowerCase()];

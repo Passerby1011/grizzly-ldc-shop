@@ -9,6 +9,7 @@
  * - `getNumber` 必须带 `maxPrice` 上限，杜绝超支。
  */
 import { dec, type Decimal, type DecimalInput } from "./money";
+import { displayCountryName } from "./service-names.zh";
 import { getPrisma } from "./db";
 import { getConfig } from "./config";
 
@@ -222,7 +223,14 @@ export function parseCountries(json: unknown): GrizzlyCountry[] {
       retry: asInt(item.retry, 0),
     });
   }
-  return out.sort((a, b) => a.eng.localeCompare(b.eng));
+  /*
+   * 按「展示名」排序，不能用 eng。
+   * 上游是按 eng 排的，但中文用户看到的是中文名，两边顺序对不上 ——
+   * 表现为「列表看着是乱的、想找的国家像丢了」。zh-Hans-CN 让排序符合中文习惯（按拼音）。
+   */
+  return out.sort((a, b) =>
+    displayCountryName(a.eng, a.chn).localeCompare(displayCountryName(b.eng, b.chn), "zh-Hans-CN"),
+  );
 }
 
 /** `{"services":[{"code":"sk","name":"Skroutz"}]}` → 数组。 */
@@ -238,7 +246,7 @@ export function parseServices(json: unknown): GrizzlyService[] {
     if (!code) continue;
     out.push({ code, name: asString(item.name) ?? code });
   }
-  return out.sort((a, b) => a.name.localeCompare(b.name));
+  return out.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
 /** `{"telegram_0":20,"aa_1":100}` → 结构化数组。 */

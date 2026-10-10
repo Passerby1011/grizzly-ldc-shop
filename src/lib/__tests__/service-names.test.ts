@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { COUNTRY_NAMES_ZH } from "../country-names.zh";
-import { displayCountryName, displayServiceName, SERVICE_NAMES_ZH } from "../service-names.zh";
+import { displayCountryName, displayServiceName, hasChineseName, SERVICE_NAMES_ZH } from "../service-names.zh";
 
 describe("displayCountryName（上游 chn → 本地补齐 → 英文）", () => {
   it("上游有中文名时优先用官方的", () => {
@@ -153,5 +153,36 @@ describe("词典卫生（负向断言：推测 code 必须不存在）", () => {
     for (const [code, name] of Object.entries(SERVICE_NAMES_ZH)) {
       expect(name.trim(), `${code} 的值不应为空`).not.toBe("");
     }
+  });
+});
+
+describe("hasChineseName —— 决定接码台默认列表", () => {
+  /*
+   * 接码台不搜索时只列「有中文名」的服务。
+   * 上游 2488 个服务绝大多数是冷门英文品牌，默认全铺出来既看不懂也找不到目标。
+   * 这组断言钉住这个行为，避免以后有人「顺手」改回全量。
+   */
+
+  it("有词典条目 → true", () => {
+    expect(hasChineseName("tg", "Telegram")).toBe(true);
+    expect(hasChineseName("wb", "WeChat")).toBe(true);
+    expect(hasChineseName("zs", "Bilibili")).toBe(true);
+  });
+
+  it("上游自带中文名 → true", () => {
+    expect(hasChineseName("zzz999", "某中文服务")).toBe(true);
+    expect(hasChineseName("zzz998", "阿里巴巴")).toBe(true);
+  });
+
+  it("冷门英文服务 → false（默认不展示，须搜索）", () => {
+    // 实测上游真实存在的 code
+    expect(hasChineseName("qu", "Agroinform")).toBe(false);
+    expect(hasChineseName("bsm", "Ahlan")).toBe(false);
+    expect(hasChineseName("cah", "AhoraCrypto")).toBe(false);
+    expect(hasChineseName("hy68", "AHOY")).toBe(false);
+  });
+
+  it("有词典条目时，即使上游名是英文也返回 true（词典优先）", () => {
+    expect(hasChineseName("tg", "SomeEnglishName")).toBe(true);
   });
 });
