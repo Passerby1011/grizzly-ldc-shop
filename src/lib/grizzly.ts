@@ -38,6 +38,7 @@ export const GRIZZLY_STATUS = {
 export type GrizzlySetStatus = (typeof GRIZZLY_STATUS)[keyof typeof GRIZZLY_STATUS];
 
 export type GrizzlyErrorCode =
+  | "EARLY_CANCEL_DENIED"
   | "BAD_KEY"
   | "BAD_ACTION"
   | "BAD_STATUS"
@@ -51,6 +52,7 @@ export type GrizzlyErrorCode =
   | "UNKNOWN";
 
 const ERROR_TOKENS: Array<[string, GrizzlyErrorCode]> = [
+  ["EARLY_CANCEL_DENIED", "EARLY_CANCEL_DENIED"],
   ["BAD_KEY", "BAD_KEY"],
   ["BAD_ACTION", "BAD_ACTION"],
   ["BAD_STATUS", "BAD_STATUS"],

@@ -16,6 +16,7 @@ import { getConfig } from "./config";
 import { dec, roundUp2, toStorageString, usdToLdc, type Decimal, type DecimalInput } from "./money";
 import { getLedger } from "./ledger";
 import {
+  GrizzlyApiError,
   GRIZZLY_STATUS,
   getGrizzlyClient,
   getPriceProvider,
@@ -249,6 +250,10 @@ export interface PollActivationResult {
   hint: string | null;
   costUsd: string | null;
   balanceUsd: string | null;
+  /** 距「可取消」的剩余秒数（<=0 表示现在就能取消）。 */
+  cancelAvailableInSeconds: number;
+  /** 可取消的时间点（ISO 时间戳）。 */
+  cancelLockedUntil: string;
 }
 
 export async function pollActivation(input: {
@@ -323,10 +328,11 @@ async function fetchSmsText(grizzly: GrizzlyClient, grizzlyId: string): Promise<
 }
 
 function toPollResult(
-  activation: { id: string; status: string; code: string | null; smsText: string | null; phone: string; costUsd: unknown; reservedUsd: unknown },
+  activation: { id: string; status: string; code: string | null; smsText: string | null; phone: string; costUsd: unknown; reservedUsd: unknown; createdAt: Date },
   hint: string | null,
 ): PollActivationResult {
   const cost = activation.costUsd ?? activation.reservedUsd;
+  const window = cancelWindow(activation.createdAt);
   return {
     activationId: activation.id,
     status: activation.status as PollActivationResult["status"],
@@ -336,6 +342,20 @@ function toPollResult(
     hint,
     costUsd: cost === null || cost === undefined ? null : dec(String(cost)).toFixed(2),
     balanceUsd: null,
+    cancelAvailableInSeconds: window.cancelAvailableInSeconds,
+    cancelLockedUntil: window.cancelLockedUntil,
+  };
+}
+
+/**
+ * 取消锁：取号后 CANCEL_LOCK_SECONDS 内不可取消（实测约 60s 会被上游拒绝）。
+ * 由 `Activation.createdAt + CANCEL_LOCK_SECONDS` 服务端计算，刷新页面也不会丢。
+ */
+function cancelWindow(createdAt: Date): { cancelAvailableInSeconds: number; cancelLockedUntil: string } {
+  const lockUntilMs = createdAt.getTime() + getConfig().CANCEL_LOCK_SECONDS * 1000;
+  return {
+    cancelAvailableInSeconds: Math.max(0, Math.ceil((lockUntilMs - Date.now()) / 1000)),
+    cancelLockedUntil: new Date(lockUntilMs).toISOString(),
   };
 }
 
@@ -369,6 +389,16 @@ export async function cancelActivation(input: {
   if (activation.status !== "waiting") {
     throw conflict(ERROR_CODES.CONFLICT, `激活状态为 ${activation.status}，无法取消`);
   }
+
+  /* 本地闸门：取号后 CANCEL_LOCK_SECONDS 内直接拒绝，不打扰上游。 */
+  const lockSeconds = getConfig().CANCEL_LOCK_SECONDS;
+  const lockUntil = activation.createdAt.getTime() + lockSeconds * 1000;
+  if (Date.now() < lockUntil) {
+    throw conflict(ERROR_CODES.CONFLICT, `取号后需等待 ${lockSeconds} 秒才能取消`, {
+      retryAfterSeconds: Math.ceil((lockUntil - Date.now()) / 1000),
+    });
+  }
+
   const grizzly = input.grizzly ?? getGrizzlyClient();
   /* 铁律 #3：setStatus(8) 成功之后才回补 */
   try {
@@ -383,7 +413,15 @@ export async function cancelActivation(input: {
       });
       throw conflict(ERROR_CODES.CONFLICT, "上游已完成激活，无法取消");
     }
-    if (state?.state !== "CANCEL") throw error;
+    if (state?.state !== "CANCEL") {
+      /* 上游仍拒绝过早取消（如其它服务阈值更高）→ 409 + 可读中文，绝不冒泡成 UNKNOWN */
+      if (error instanceof GrizzlyApiError && error.code === "EARLY_CANCEL_DENIED") {
+        throw conflict(ERROR_CODES.CONFLICT, "上游暂不允许取消，请稍后再试", {
+          retryAfterSeconds: 15,
+        });
+      }
+      throw error;
+    }
   }
   const result = await cancelActivationInternal(activation.id, "manual");
   return {

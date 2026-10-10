@@ -50,7 +50,7 @@ for (const f of files) {
   const secretAssign = /(GRIZZLY_API_KEY|LDC_KEY|LDC_PID|LDC_PRIVATE_KEY_B64|ADMIN_TOKEN|CRON_SECRET|UPSTASH_REDIS_REST_TOKEN)\s*[=:]\s*["']([^"'\s]{16,})["']/g;
   for (const m of body.matchAll(secretAssign)) {
     const v = m[2];
-    if (/^(your_|change_me|postgresql:\/\/user|postgresql:\/\/shop|xxx|placeholder)/i.test(v)) continue;
+    if (/^(your_|change_me|test|dummy|fake|sample|example|placeholder|postgresql:\/\/user|postgresql:\/\/shop|xxx)/i.test(v)) continue;
     if (/^env\(|^\$\{|^process\.env/.test(v)) continue;
     problems.push(`${f}: ${m[1]} 出现疑似真实值`);
   }

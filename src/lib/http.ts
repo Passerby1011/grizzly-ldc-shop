@@ -10,7 +10,7 @@ import { z, type ZodTypeAny } from "zod";
 import { ConfigError, tryGetConfig } from "./config";
 import { KeyNotFoundError, InsufficientBalanceError } from "./ledger";
 import { PoolExhaustedError } from "./pool";
-import { GrizzlyApiError, GrizzlyTransportError } from "./grizzly";
+import { GrizzlyApiError, GrizzlyTransportError, type GrizzlyErrorCode } from "./grizzly";
 import { LdcApiError } from "./ldc";
 import { LockBusyError } from "./idempotency";
 import { constantTimeEqual, signSessionToken, verifySessionToken } from "./keycodec";
@@ -127,9 +127,10 @@ export function toErrorResponse(error: unknown): Response {
     return jsonError(ERROR_CODES.LOCK_BUSY, error.message, 409);
   }
   if (error instanceof GrizzlyApiError) {
-    return jsonError(ERROR_CODES.UPSTREAM_ERROR, `上游错误：${error.code}`, 502, {
+    return jsonError(ERROR_CODES.UPSTREAM_ERROR, grizzlyMessageZh(error), 502, {
       upstream: "grizzly",
       code: error.code,
+      upstreamRaw: error.raw.slice(0, 200),
     });
   }
   if (error instanceof GrizzlyTransportError) {
@@ -153,6 +154,25 @@ export function toErrorResponse(error: unknown): Response {
   console.error("[api] 未处理异常", error);
   const message = error instanceof Error ? error.message : "服务器内部错误";
   return jsonError(ERROR_CODES.INTERNAL, message, 500);
+}
+
+/** Grizzly 错误码 → 中文可读文案；未映射的码走通用兜底，绝不把 `UNKNOWN` 字面量抛给用户。 */
+const GRIZZLY_MESSAGE_ZH: Partial<Record<GrizzlyErrorCode, string>> = {
+  EARLY_CANCEL_DENIED: "取号后短时间内上游不允许取消，请稍后再试",
+  NO_ACTIVATION: "该号码已结束（收到验证码、被取消或已超时退款）",
+  NO_NUMBERS: "当前国家/服务暂时没有可用号码，请换个组合试试",
+  NO_BALANCE: "上游主账号余额不足，请联系卖家",
+  BAD_KEY: "上游密钥无效，请联系卖家",
+  SERVICE_UNAVAILABLE_REGION: "上游限制了当前出口地区，请联系卖家",
+  SERVICE_PROHIBITED: "该服务被上游禁止销售，请换一个",
+  WRONG_MAX_PRICE: "出价低于上游成本，请重新估价",
+  BAD_ACTION: "上游接口不支持该操作，请联系卖家",
+  BAD_STATUS: "上游拒绝了该状态变更",
+  EMPTY_RESPONSE: "上游返回了空响应，请稍后再试",
+};
+
+function grizzlyMessageZh(error: GrizzlyApiError): string {
+  return GRIZZLY_MESSAGE_ZH[error.code] ?? "上游返回了未识别的响应，请稍后再试或联系卖家";
 }
 
 export type RouteHandler = (request: Request) => Promise<Response>;

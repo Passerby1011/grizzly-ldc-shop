@@ -32,6 +32,11 @@ describe("错误映射", () => {
     expect(mapGrizzlyError("SERVICE_UNAVAILABLE_REGION")).toBe("SERVICE_UNAVAILABLE_REGION");
   });
 
+  it("识别 EARLY_CANCEL_DENIED（2026-10-10 实测：取消过早返回的纯文本）", () => {
+    expect(mapGrizzlyError("EARLY_CANCEL_DENIED")).toBe("EARLY_CANCEL_DENIED");
+    expect(mapGrizzlyError("EARLY_CANCEL_DENIED:try later")).toBe("EARLY_CANCEL_DENIED");
+  });
+
   it("识别「禁止销售」自由文本", () => {
     expect(mapGrizzlyError("The service is prohibited for sale by administration")).toBe(
       "SERVICE_PROHIBITED",
@@ -125,6 +130,17 @@ describe("解析：setStatus", () => {
     expect(parseSetStatus("ACCESS_ACTIVATION")).toBe("ACTIVATION");
     expect(parseSetStatus("ACCESS_CANCEL")).toBe("CANCEL");
     expect(parseSetStatus("ACCESS_RETRY_GET")).toBe("RETRY_GET");
+  });
+
+  it("EARLY_CANCEL_DENIED 抛 GrizzlyApiError 且 code 正确（不再是 UNKNOWN）", () => {
+    try {
+      parseSetStatus("EARLY_CANCEL_DENIED");
+      throw new Error("不该走到这里");
+    } catch (error) {
+      expect(error).toBeInstanceOf(GrizzlyApiError);
+      expect((error as GrizzlyApiError).code).toBe("EARLY_CANCEL_DENIED");
+      expect((error as GrizzlyApiError).raw).toBe("EARLY_CANCEL_DENIED");
+    }
   });
 });
 

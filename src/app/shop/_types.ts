@@ -54,6 +54,10 @@ export interface PollView {
   hint: string | null;
   costUsd: string | null;
   balanceUsd: string | null;
+  /** 距「可取消」的剩余秒数（<=0 表示现在就能取消）。 */
+  cancelAvailableInSeconds: number;
+  /** 可取消的时间点（ISO 时间戳）。 */
+  cancelLockedUntil: string;
 }
 
 export interface OrderQueryView {

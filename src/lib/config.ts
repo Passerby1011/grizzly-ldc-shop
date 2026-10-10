@@ -65,6 +65,8 @@ const EnvSchema = z.object({
   RATE_LDC_PER_USD: numberFromEnv(1.1, 0.000001),
   MARKUP_PCT: numberFromEnv(0, 0, 10000),
   SAFETY_BUFFER_USD: numberFromEnv(0.5, 0),
+  // 取号后可取消的最短等待秒数（实测 Grizzly 约 60s 拒绝 EARLY_CANCEL_DENIED）
+  CANCEL_LOCK_SECONDS: numberFromEnv(90, 0),
   NEXT_PUBLIC_APP_URL: absoluteUrl.default("http://localhost:3000"),
 
   // 对账 Cron

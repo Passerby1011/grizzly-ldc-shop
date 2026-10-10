@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { apiGet, apiPost, errorMessage } from "./_api";
+import { displayCountryName, displayServiceName } from "@/lib/service-names.zh";
+import { ApiCallError, apiGet, apiPost, errorMessage } from "./_api";
 import type {
   ActivationView,
   CountryView,
@@ -15,6 +16,28 @@ import type {
 
 /** 接码台轮询间隔：每 4 秒问一次上游状态。 */
 const POLL_INTERVAL_MS = 4000;
+
+/** 国家 + 服务都选好后，自动估价的防抖等待。 */
+const QUOTE_DEBOUNCE_MS = 400;
+
+/** 秒 → `mm:ss`（取消倒计时展示用）。 */
+function formatCountdown(seconds: number): string {
+  const total = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(total / 60)
+    .toString()
+    .padStart(2, "0");
+  const rest = (total % 60).toString().padStart(2, "0");
+  return `${minutes}:${rest}`;
+}
+
+/** 从 409 的 details 里取 retryAfterSeconds（服务端建议的重试等待秒数）。 */
+function retryAfterSecondsOf(error: unknown): number | null {
+  if (!(error instanceof ApiCallError)) return null;
+  const details = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const value = (details as { retryAfterSeconds?: unknown }).retryAfterSeconds;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.ceil(value) : null;
+}
 
 export default function ShopPage() {
   const [codeInput, setCodeInput] = useState("");
@@ -35,6 +58,10 @@ export default function ShopPage() {
 
   const [activation, setActivation] = useState<ActivationView | null>(null);
   const [poll, setPoll] = useState<PollView | null>(null);
+  /** 取消倒计时剩余秒数；null = 还没拿到服务端数据（按锁定处理）。 */
+  const [cancelLeft, setCancelLeft] = useState<number | null>(null);
+  /** 估价请求序号：递增后丢弃过期响应，避免乱序覆盖。 */
+  const quoteSeqRef = useRef(0);
 
   const cancelledRef = useRef(false);
   useEffect(() => {
@@ -145,14 +172,45 @@ export default function ShopPage() {
     };
   }, [activation, poll?.status]);
 
+  /* 取消倒计时以服务端返回的剩余秒数为准（刷新页面也不丢），本地每秒递减 */
+  useEffect(() => {
+    if (poll && Number.isFinite(poll.cancelAvailableInSeconds)) {
+      setCancelLeft(poll.cancelAvailableInSeconds);
+    }
+  }, [poll]);
+
+  const cancelTicking = cancelLeft !== null && cancelLeft > 0;
+  useEffect(() => {
+    if (!cancelTicking) return;
+    const timer = setInterval(() => {
+      setCancelLeft((prev) => (prev === null || prev <= 0 ? prev : prev - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [cancelTicking]);
+
+  /* 倒计时未归零（或还没拿到服务端数据）时，取消按钮一律禁用 */
+  const cancelPending = cancelLeft === null || cancelLeft > 0;
+
   const filteredServices = useMemo(() => {
     const needle = serviceFilter.trim().toLowerCase();
     const list = needle
-      ? services.filter(
-          (item) => item.code.toLowerCase().includes(needle) || item.name.toLowerCase().includes(needle),
-        )
+      ? services.filter((item) => {
+          const zh = displayServiceName(item.code, item.name).toLowerCase();
+          return (
+            item.code.toLowerCase().includes(needle) ||
+            item.name.toLowerCase().includes(needle) ||
+            zh.includes(needle)
+          );
+        })
       : services;
-    return list.slice(0, 300);
+    /* 上游返回顺序每次都被打乱，展示前按展示名做确定性排序 */
+    return [...list]
+      .sort((a, b) => {
+        const nameA = displayServiceName(a.code, a.name);
+        const nameB = displayServiceName(b.code, b.name);
+        return nameA.localeCompare(nameB, "zh-Hans-CN") || a.code.localeCompare(b.code);
+      })
+      .slice(0, 300);
   }, [services, serviceFilter]);
 
   const refreshMe = useCallback(async () => {
@@ -169,11 +227,30 @@ export default function ShopPage() {
 
   const quotePrice = useCallback(async () => {
     if (!service || !country) return;
-    const view = await apiGet<QuoteView>(
-      `/api/sms/price?service=${encodeURIComponent(service)}&country=${encodeURIComponent(country)}`,
-    );
-    setQuote(view);
+    const seq = (quoteSeqRef.current += 1);
+    try {
+      const view = await apiGet<QuoteView>(
+        `/api/sms/price?service=${encodeURIComponent(service)}&country=${encodeURIComponent(country)}`,
+      );
+      /* 丢弃过期响应：只有最新一次请求可以写状态 */
+      if (seq !== quoteSeqRef.current) return;
+      setQuote(view);
+    } catch (error) {
+      if (seq !== quoteSeqRef.current) return;
+      throw error;
+    }
   }, [service, country]);
+
+  /* 国家 + 服务都选好 → ~400ms 防抖自动估价；按钮保留为手动刷新 */
+  useEffect(() => {
+    if (!service || !country) return;
+    const timer = setTimeout(() => {
+      void quotePrice().catch(() => {
+        // 自动估价失败静默；用户可点「重新估价」重试
+      });
+    }, QUOTE_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [service, country, quotePrice]);
 
   const getNumber = useCallback(async () => {
     if (!service || !country) return;
@@ -184,22 +261,41 @@ export default function ShopPage() {
     });
     setActivation(view);
     setPoll(null);
+    setCancelLeft(null);
     setNotice(`已取号 ${view.phone}，预扣 ${view.reservedUsd} USD，实际成本 ${view.costUsd} USD`);
   }, [service, country, quote?.maxPriceUsd]);
 
   const cancel = useCallback(async () => {
     if (!activation) return;
-    const result = await apiPost<{ refundedUsd: string; balanceUsd: string | null }>("/api/sms/cancel", {
-      activationId: activation.activationId,
-    });
-    setPoll((prev) => (prev ? { ...prev, status: "cancelled" } : prev));
-    if (result.balanceUsd) {
-      setSession((prev) => (prev ? { ...prev, balanceUsd: result.balanceUsd as string } : prev));
+    try {
+      const result = await apiPost<{ refundedUsd: string; balanceUsd: string | null }>("/api/sms/cancel", {
+        activationId: activation.activationId,
+      });
+      setPoll((prev) => (prev ? { ...prev, status: "cancelled" } : prev));
+      setCancelLeft(0);
+      if (result.balanceUsd) {
+        setSession((prev) => (prev ? { ...prev, balanceUsd: result.balanceUsd as string } : prev));
+      }
+      setNotice(`已取消，回补 ${result.refundedUsd} USD`);
+    } catch (error) {
+      /* 服务端 409 带 retryAfterSeconds：重置倒计时 + 可读提示 */
+      const retryAfter = retryAfterSecondsOf(error);
+      if (retryAfter !== null) {
+        setCancelLeft(retryAfter);
+        setNotice(null);
+      }
+      throw error;
     }
-    setNotice(`已取消，回补 ${result.refundedUsd} USD`);
   }, [activation]);
 
   const running = poll?.status === "waiting" || (!poll && activation !== null);
+
+  const cancelLabel =
+    busy === "cancel"
+      ? "取消中…"
+      : cancelPending && cancelLeft !== null
+        ? `可取消倒计时 ${formatCountdown(cancelLeft)}`
+        : "取消并回补";
 
   return (
     <div className="space-y-6">
@@ -297,7 +393,7 @@ export default function ShopPage() {
                   <option value="">请选择…</option>
                   {countries.map((item) => (
                     <option key={item.id} value={String(item.id)}>
-                      {item.eng}（#{item.id}）
+                      {displayCountryName(item.eng, item.chn)}（#{item.id}）
                     </option>
                   ))}
                 </select>
@@ -324,7 +420,7 @@ export default function ShopPage() {
                 >
                   {filteredServices.map((item) => (
                     <option key={item.code} value={item.code}>
-                      {item.name}（{item.code}）
+                      {displayServiceName(item.code, item.name)}（{item.code}）
                     </option>
                   ))}
                 </select>
@@ -338,7 +434,7 @@ export default function ShopPage() {
                 disabled={!service || !country || busy === "quote"}
                 onClick={() => void run("quote", quotePrice)}
               >
-                {busy === "quote" ? "估价中…" : "估价"}
+                {busy === "quote" ? "估价中…" : "重新估价"}
               </button>
               <button
                 type="button"
@@ -387,14 +483,19 @@ export default function ShopPage() {
           )}
 
           {running && !poll?.code ? (
-            <button
-              type="button"
-              className="btn btn-danger"
-              disabled={busy === "cancel"}
-              onClick={() => void run("cancel", cancel)}
-            >
-              {busy === "cancel" ? "取消中…" : "取消并回补"}
-            </button>
+            <div className="space-y-1">
+              <button
+                type="button"
+                className="btn btn-danger"
+                disabled={busy === "cancel" || cancelPending}
+                onClick={() => void run("cancel", cancel)}
+              >
+                {cancelLabel}
+              </button>
+              {cancelPending ? (
+                <p className="text-xs text-slate-500">上游取号后约 60 秒内不允许取消</p>
+              ) : null}
+            </div>
           ) : null}
         </section>
       ) : null}
