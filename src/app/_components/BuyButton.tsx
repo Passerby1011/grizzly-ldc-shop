@@ -36,7 +36,11 @@ export function BuyButton({ faceUsd, amountLdc }: BuyButtonProps) {
       <button type="button" className="btn btn-primary w-full" onClick={buy} disabled={busy}>
         {busy ? "正在跳转…" : `用 ${amountLdc} LDC 购买`}
       </button>
-      {error ? <p className="text-xs text-rose-400">{error}</p> : null}
+      {error ? (
+        <p className="text-xs" role="alert" style={{ color: "rgb(var(--danger))" }}>
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }

@@ -2,46 +2,337 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ==========================================================================
+   设计令牌（浅色主题）
+   全部颜色走 CSS 变量，组件不写死 hex —— 以后要换深色只改这里。
+   ========================================================================== */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+
+  /* 层次：页面底 → 卡片 → 悬浮/选中 */
+  --bg: 246 248 252;
+  --bg-soft: 255 255 255;
+  --surface: 255 255 255;
+  --surface-2: 252 253 255;
+  --surface-3: 241 245 250;
+
+  /* 描边：浅色下用深色低透明度，比纯灰更透气 */
+  --line: 15 23 42;
+  --line-a: 0.09;
+  --line-strong-a: 0.16;
+
+  /* 文字 */
+  --fg: 15 23 42;
+  --fg-muted: 71 85 105;
+  --fg-faint: 122 134 154;
+
+  /* 主色与语义色（浅色下需更饱和才够对比） */
+  --brand: 79 70 229;
+  --brand-strong: 67 56 202;
+  --ok: 5 150 105;
+  --warn: 202 111 6;
+  --danger: 225 29 72;
+  --info: 2 132 199;
+
+  /* 圆角与阴影（浅色下阴影承担主要层次感，要更柔更长） */
+  --r-card: 16px;
+  --r-control: 10px;
+  --r-pill: 999px;
+  --shadow: 0 1px 2px rgb(15 23 42 / 0.06), 0 12px 32px -14px rgb(15 23 42 / 0.18);
+  --shadow-sm: 0 1px 2px rgb(15 23 42 / 0.06), 0 6px 16px -10px rgb(15 23 42 / 0.16);
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+* {
+  border-color: rgb(var(--line) / var(--line-a));
 }
 
 body {
-  @apply bg-slate-950 text-slate-100 antialiased;
+  background:
+    radial-gradient(1000px 560px at 10% -10%, rgb(99 102 241 / 0.1), transparent 60%),
+    radial-gradient(820px 480px at 96% 0%, rgb(139 92 246 / 0.08), transparent 58%),
+    rgb(var(--bg));
+  background-attachment: fixed;
+  color: rgb(var(--fg));
+  -webkit-font-smoothing: antialiased;
 }
 
-.card {
-  @apply rounded-xl border border-slate-800 bg-slate-900/60 p-5 shadow-lg shadow-black/20;
+/* 数字等宽对齐，金额/倒计时不跳动 */
+.tnum {
+  font-variant-numeric: tabular-nums;
 }
 
-.btn {
-  @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
-}
+/* ==========================================================================
+   组件层
+   ========================================================================== */
+@layer components {
+  .surface {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--line) / var(--line-a));
+    border-radius: var(--r-card);
+    box-shadow: var(--shadow);
+  }
 
-.btn-primary {
-  @apply bg-indigo-500 text-white hover:bg-indigo-400;
-}
+  /* 兼容旧类名 */
+  .card {
+    @apply surface;
+    padding: 1.25rem;
+  }
 
-.btn-ghost {
-  @apply border border-slate-700 text-slate-200 hover:bg-slate-800;
-}
+  .card-quiet {
+    background: rgb(var(--surface-3) / 0.7);
+    border: 1px solid rgb(var(--line) / var(--line-a));
+    border-radius: var(--r-card);
+    padding: 1.25rem;
+  }
 
-.btn-danger {
-  @apply border border-rose-800 text-rose-300 hover:bg-rose-950/40;
-}
+  /* 顶部彩色细线，让卡片有被照亮的层次 */
+  .card-lit {
+    position: relative;
+    overflow: hidden;
+  }
+  .card-lit::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: linear-gradient(90deg, rgb(var(--brand) / 0.9), rgb(139 92 246 / 0.7), transparent);
+  }
 
-.input {
-  @apply w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-indigo-500;
-}
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: var(--r-control);
+    padding: 0.55rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    white-space: nowrap;
+    transition:
+      background-color 160ms var(--ease),
+      border-color 160ms var(--ease),
+      color 160ms var(--ease),
+      transform 160ms var(--ease),
+      box-shadow 160ms var(--ease);
+  }
+  .btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
 
-.label {
-  @apply mb-1 block text-xs font-medium uppercase tracking-wide text-slate-400;
-}
+  .btn-primary {
+    background: linear-gradient(180deg, rgb(var(--brand)), rgb(var(--brand-strong)));
+    color: #fff;
+    box-shadow:
+      0 1px 2px rgb(15 23 42 / 0.12),
+      0 8px 20px -10px rgb(79 70 229 / 0.6),
+      inset 0 1px 0 rgb(255 255 255 / 0.22);
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.06);
+  }
 
-.badge {
-  @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
-}
+  .btn-ghost {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--line) / var(--line-strong-a));
+    color: rgb(var(--fg));
+    box-shadow: 0 1px 2px rgb(15 23 42 / 0.04);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: rgb(var(--surface-3));
+  }
 
-.muted {
-  @apply text-sm text-slate-400;
+  .btn-danger {
+    background: rgb(var(--danger) / 0.08);
+    border: 1px solid rgb(var(--danger) / 0.35);
+    color: rgb(var(--danger));
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: rgb(var(--danger) / 0.14);
+  }
+
+  .btn-sm {
+    padding: 0.3rem 0.65rem;
+    font-size: 0.75rem;
+    border-radius: 8px;
+  }
+
+  .input {
+    width: 100%;
+    border-radius: var(--r-control);
+    border: 1px solid rgb(var(--line) / var(--line-strong-a));
+    background: rgb(var(--bg-soft));
+    padding: 0.55rem 0.75rem;
+    font-size: 0.875rem;
+    color: rgb(var(--fg));
+    outline: none;
+    transition:
+      border-color 160ms var(--ease),
+      box-shadow 160ms var(--ease);
+  }
+  .input::placeholder {
+    color: rgb(var(--fg-faint));
+  }
+  .input:focus {
+    border-color: rgb(var(--brand) / 0.7);
+    box-shadow: 0 0 0 3px rgb(var(--brand) / 0.14);
+  }
+  select.input option {
+    background: #fff;
+    color: rgb(var(--fg));
+  }
+
+  /* 键盘可达性：可聚焦元素都要有清晰焦点环 */
+  a:focus-visible,
+  button:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid rgb(var(--brand));
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  .label {
+    display: block;
+    margin-bottom: 0.35rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: rgb(var(--fg-muted));
+  }
+
+  .muted {
+    font-size: 0.875rem;
+    color: rgb(var(--fg-muted));
+  }
+
+  .faint {
+    font-size: 0.75rem;
+    color: rgb(var(--fg-faint));
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border-radius: var(--r-pill);
+    border: 1px solid rgb(var(--line) / var(--line-strong-a));
+    background: rgb(var(--surface-3));
+    padding: 0.15rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    line-height: 1.1rem;
+    color: rgb(var(--fg-muted));
+  }
+  .badge-ok {
+    border-color: rgb(var(--ok) / 0.3);
+    background: rgb(var(--ok) / 0.1);
+    color: rgb(var(--ok));
+  }
+  .badge-warn {
+    border-color: rgb(var(--warn) / 0.3);
+    background: rgb(var(--warn) / 0.1);
+    color: rgb(var(--warn));
+  }
+  .badge-danger {
+    border-color: rgb(var(--danger) / 0.3);
+    background: rgb(var(--danger) / 0.1);
+    color: rgb(var(--danger));
+  }
+  .badge-info {
+    border-color: rgb(var(--brand) / 0.28);
+    background: rgb(var(--brand) / 0.09);
+    color: rgb(var(--brand));
+  }
+
+  /* 卡片流里的步骤序号 */
+  .step-dot {
+    display: inline-flex;
+    height: 1.5rem;
+    width: 1.5rem;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--r-pill);
+    background: rgb(var(--brand) / 0.1);
+    border: 1px solid rgb(var(--brand) / 0.3);
+    color: rgb(var(--brand));
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+
+  .code-display {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.14em;
+  }
+
+  .divider {
+    height: 1px;
+    background: rgb(var(--line) / var(--line-a));
+  }
+
+  /* 表格 */
+  .tbl {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.8125rem;
+  }
+  .tbl th {
+    text-align: left;
+    font-weight: 500;
+    color: rgb(var(--fg-muted));
+    background: rgb(var(--surface-3) / 0.6);
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid rgb(var(--line) / var(--line-a));
+    white-space: nowrap;
+  }
+  .tbl td {
+    padding: 0.55rem 0.7rem;
+    border-bottom: 1px solid rgb(var(--line) / calc(var(--line-a) * 0.8));
+  }
+  .tbl tbody tr:hover td {
+    background: rgb(var(--surface-3) / 0.75);
+  }
+  .tbl tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  /* 验证码到达时的高亮 */
+  @keyframes code-pop {
+    0% {
+      transform: scale(0.97);
+      box-shadow: 0 0 0 0 rgb(var(--ok) / 0.4);
+    }
+    60% {
+      transform: scale(1.01);
+    }
+    100% {
+      transform: scale(1);
+      box-shadow: 0 0 0 10px rgb(var(--ok) / 0);
+    }
+  }
+  .code-arrived {
+    animation: code-pop 700ms var(--ease);
+  }
+
+  .progress-track {
+    position: relative;
+    height: 6px;
+    overflow: hidden;
+    border-radius: var(--r-pill);
+    background: rgb(var(--line) / 0.1);
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: var(--r-pill);
+    background: linear-gradient(90deg, rgb(var(--warn)), rgb(var(--brand)));
+    transition: width 950ms linear;
+  }
 }

@@ -60,6 +60,10 @@ export default function ShopPage() {
   const [poll, setPoll] = useState<PollView | null>(null);
   /** 取消倒计时剩余秒数；null = 还没拿到服务端数据（按锁定处理）。 */
   const [cancelLeft, setCancelLeft] = useState<number | null>(null);
+  /** 本轮倒计时的起始总秒数，用于算进度条百分比。 */
+  const [cancelTotal, setCancelTotal] = useState<number | null>(null);
+  /** 复制按钮的瞬时反馈。 */
+  const [copied, setCopied] = useState(false);
   /** 估价请求序号：递增后丢弃过期响应，避免乱序覆盖。 */
   const quoteSeqRef = useRef(0);
 
@@ -176,6 +180,9 @@ export default function ShopPage() {
   useEffect(() => {
     if (poll && Number.isFinite(poll.cancelAvailableInSeconds)) {
       setCancelLeft(poll.cancelAvailableInSeconds);
+      setCancelTotal((prev) =>
+        prev === null || poll.cancelAvailableInSeconds > prev ? poll.cancelAvailableInSeconds : prev,
+      );
     }
   }, [poll]);
 
@@ -262,6 +269,7 @@ export default function ShopPage() {
     setActivation(view);
     setPoll(null);
     setCancelLeft(null);
+    setCancelTotal(null);
     setNotice(`已取号 ${view.phone}，预扣 ${view.reservedUsd} USD，实际成本 ${view.costUsd} USD`);
   }, [service, country, quote?.maxPriceUsd]);
 
@@ -273,6 +281,7 @@ export default function ShopPage() {
       });
       setPoll((prev) => (prev ? { ...prev, status: "cancelled" } : prev));
       setCancelLeft(0);
+      setCancelTotal(null);
       if (result.balanceUsd) {
         setSession((prev) => (prev ? { ...prev, balanceUsd: result.balanceUsd as string } : prev));
       }
@@ -282,11 +291,23 @@ export default function ShopPage() {
       const retryAfter = retryAfterSecondsOf(error);
       if (retryAfter !== null) {
         setCancelLeft(retryAfter);
+        setCancelTotal(retryAfter);
         setNotice(null);
       }
       throw error;
     }
   }, [activation]);
+
+  /** 复制验证码：优先 Clipboard API，失败则兜底选中文本提示手抄。 */
+  const copyCode = useCallback(async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setNotice("浏览器拒绝了剪贴板访问，请手动选中复制");
+    }
+  }, []);
 
   const running = poll?.status === "waiting" || (!poll && activation !== null);
 
@@ -299,13 +320,20 @@ export default function ShopPage() {
 
   return (
     <div className="space-y-6">
-      <header className="space-y-2">
-        <h1 className="text-2xl font-semibold">接码台</h1>
-        <p className="muted">贴卡密 → 选国家 / 服务 → 估价 → 取号 → 每 4 秒自动轮询验证码。</p>
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold">接码台</h1>
+          <p className="muted">贴卡密 → 选国家 / 服务 → 估价 → 取号 → 每 4 秒自动轮询验证码。</p>
+        </div>
+        <span className="badge badge-info">实时扣费 · 取消回补</span>
       </header>
 
       {orderError ? (
-        <div className="card border-rose-900 text-rose-300">查单失败：{orderError}</div>
+        <div className="card" role="alert" style={{ borderColor: "rgb(var(--danger) / 0.4)" }}>
+          <p className="text-sm" style={{ color: "rgb(var(--danger))" }}>
+            查单失败：{orderError}
+          </p>
+        </div>
       ) : null}
 
       {order ? (
@@ -332,15 +360,20 @@ export default function ShopPage() {
       ) : null}
 
       {!session ? (
-        <section className="card space-y-3">
-          <h2 className="text-sm font-semibold">1. 贴入卡密</h2>
+        <section className="card card-lit space-y-3">
+          <h2 className="flex items-center gap-2 text-sm font-semibold">
+            <span className="step-dot">1</span>
+            贴入卡密进入接码台
+          </h2>
           <input
-            className="input font-mono tracking-wider"
+            className="input code-display text-base"
             placeholder="GS-XXXX-XXXX-XXXX-XXXX"
             value={codeInput}
             onChange={(event) => setCodeInput(event.target.value)}
             autoComplete="off"
+            aria-label="卡密"
           />
+          <p className="faint">卡密只用于本站扣费；本站不会向第三方泄露你的卡密。</p>
           <button
             type="button"
             className="btn btn-primary"
@@ -352,30 +385,42 @@ export default function ShopPage() {
         </section>
       ) : (
         <>
-          <section className="card space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <section className="card card-lit">
+            <div className="flex flex-wrap items-center justify-between gap-6">
               <div>
-                <p className="text-xs uppercase tracking-wide text-slate-400">当前卡密</p>
-                <p className="font-mono text-lg tracking-wider">{session.maskedCode}</p>
+                <p className="faint">当前卡密</p>
+                <p className="code-display mt-1 text-lg">{session.maskedCode}</p>
+                <p className="faint mt-1">面值 ${session.faceUsd}</p>
               </div>
-              <div className="text-right">
-                <p className="text-xs uppercase tracking-wide text-slate-400">余额</p>
-                <p className="text-lg font-semibold">{session.balanceUsd} USD</p>
-                <p className="text-xs text-slate-500">面值 ${session.faceUsd}</p>
+              <div
+                className="rounded-2xl px-5 py-3 text-right"
+                style={{
+                  background: "rgb(var(--brand) / 0.1)",
+                  border: "1px solid rgb(var(--brand) / 0.3)",
+                }}
+              >
+                <p className="faint">可用余额</p>
+                <p className="tnum mt-0.5 text-3xl font-semibold" style={{ color: "rgb(var(--brand))" }}>
+                  ${session.balanceUsd}
+                </p>
+                <p className="faint">USD</p>
               </div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                disabled={busy === "me"}
+                onClick={() => void run("me", refreshMe)}
+              >
+                {busy === "me" ? "刷新中…" : "刷新余额"}
+              </button>
             </div>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              disabled={busy === "me"}
-              onClick={() => void run("me", refreshMe)}
-            >
-              {busy === "me" ? "刷新中…" : "刷新余额"}
-            </button>
           </section>
 
-          <section className="card space-y-4">
-            <h2 className="text-sm font-semibold">2. 选国家 / 服务</h2>
+          <section className="card space-y-5">
+            <h2 className="flex items-center gap-2 text-sm font-semibold">
+              <span className="step-dot">2</span>
+              选国家 / 服务
+            </h2>
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
                 <label className="label" htmlFor="country">
@@ -400,12 +445,12 @@ export default function ShopPage() {
               </div>
               <div>
                 <label className="label" htmlFor="serviceFilter">
-                  服务（可搜索）
+                  服务（可搜索，支持中文 / 英文 / code）
                 </label>
                 <input
                   id="serviceFilter"
                   className="input mb-2"
-                  placeholder="例如 telegram / whatsapp"
+                  placeholder="例如 telegram / 电报 / tg"
                   value={serviceFilter}
                   onChange={(event) => setServiceFilter(event.target.value)}
                 />
@@ -413,6 +458,7 @@ export default function ShopPage() {
                   className="input"
                   size={5}
                   value={service}
+                  aria-label="服务"
                   onChange={(event) => {
                     setService(event.target.value);
                     setQuote(null);
@@ -430,60 +476,144 @@ export default function ShopPage() {
             <div className="flex flex-wrap items-center gap-3">
               <button
                 type="button"
-                className="btn btn-ghost"
-                disabled={!service || !country || busy === "quote"}
-                onClick={() => void run("quote", quotePrice)}
-              >
-                {busy === "quote" ? "估价中…" : "重新估价"}
-              </button>
-              <button
-                type="button"
                 className="btn btn-primary"
                 disabled={!service || !country || busy === "get" || running}
                 onClick={() => void run("get", getNumber)}
               >
                 {busy === "get" ? "取号中…" : "获取号码"}
               </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={!service || !country || busy === "quote"}
+                onClick={() => void run("quote", quotePrice)}
+              >
+                {busy === "quote" ? "估价中…" : "重新估价"}
+              </button>
+
               {quote ? (
-                <p className="muted">
-                  估价 {quote.priceUsd} USD（{quote.source}）
-                  {quote.available === null ? "" : ` · 可用 ${quote.available}`}
-                </p>
-              ) : null}
+                <div
+                  className="flex items-center gap-2 rounded-lg px-3 py-1.5"
+                  style={{
+                    background: "rgb(var(--surface-3) / 0.6)",
+                    border: "1px solid rgb(var(--line) / var(--line-strong-a))",
+                  }}
+                >
+                  <span className="faint">估价</span>
+                  <span className="tnum text-sm font-medium" style={{ color: "rgb(var(--info))" }}>
+                    {quote.priceUsd} USD
+                  </span>
+                  <span className="faint">（{quote.source}）</span>
+                  {quote.available === null ? null : (
+                    <span className="faint">· 可用 {quote.available}</span>
+                  )}
+                </div>
+              ) : (
+                <span className="faint">选好国家和服务后会自动估价</span>
+              )}
             </div>
-            {quote ? <p className="text-xs text-slate-500">{quote.disclaimer}</p> : null}
+            {quote ? <p className="faint leading-relaxed">{quote.disclaimer}</p> : null}
           </section>
         </>
       )}
 
       {activation ? (
-        <section className="card space-y-3">
-          <h2 className="text-sm font-semibold">3. 取号结果</h2>
-          <div className="grid gap-2 sm:grid-cols-2">
-            <p className="muted">
-              号码：<span className="font-mono text-base text-slate-100">{activation.phone}</span>
-            </p>
-            <p className="muted">
-              预扣 {activation.reservedUsd} USD · 实际成本 {activation.costUsd} USD
-            </p>
+        <section className="card space-y-4">
+          <h2 className="flex items-center gap-2 text-sm font-semibold">
+            <span className="step-dot">3</span>
+            取号结果
+          </h2>
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="card-quiet">
+              <p className="faint">号码</p>
+              <p className="code-display mt-1 text-base">{activation.phone}</p>
+            </div>
+            <div className="card-quiet">
+              <p className="faint">预扣上限</p>
+              <p className="tnum mt-1 text-base">${activation.reservedUsd}</p>
+            </div>
+            <div className="card-quiet">
+              <p className="faint">实际成本</p>
+              <p className="tnum mt-1 text-base">${activation.costUsd}</p>
+            </div>
           </div>
 
           {poll?.status === "ok" && poll.code ? (
-            <div className="space-y-1 rounded-lg border border-emerald-800 bg-emerald-950/30 p-4">
-              <p className="text-xs text-emerald-300">验证码</p>
-              <p className="select-all font-mono text-2xl tracking-widest text-emerald-200">{poll.code}</p>
-              {poll.smsText ? <p className="text-xs text-emerald-300/80">短信全文：{poll.smsText}</p> : null}
+            <div
+              className="code-arrived space-y-2 rounded-xl p-4"
+              style={{
+                border: "1px solid rgb(var(--ok) / 0.45)",
+                background: "rgb(var(--ok) / 0.1)",
+              }}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs font-medium" style={{ color: "rgb(var(--ok))" }}>
+                  验证码已到达
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => void copyCode(poll.code as string)}
+                >
+                  {copied ? "已复制 ✓" : "复制"}
+                </button>
+              </div>
+              <p
+                className="code-display select-all text-3xl"
+                style={{ color: "rgb(var(--ok))" }}
+                aria-live="polite"
+              >
+                {poll.code}
+              </p>
+              {poll.smsText ? (
+                <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--ok) / 0.8)" }}>
+                  短信全文：{poll.smsText}
+                </p>
+              ) : null}
             </div>
           ) : poll?.status === "cancelled" ? (
             <p className="muted">已取消，余额已回补。</p>
           ) : (
-            <p className="muted">
-              等待短信…每 4 秒自动刷新{poll?.hint ? ` · ${poll.hint}` : ""}
-            </p>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span
+                  className="inline-block h-2 w-2 animate-pulse rounded-full"
+                  style={{ background: "rgb(var(--info))" }}
+                  aria-hidden="true"
+                />
+                <p className="muted">
+                  等待短信…每 4 秒自动刷新{poll?.hint ? ` · ${poll.hint}` : ""}
+                </p>
+              </div>
+
+              {cancelPending && cancelLeft !== null ? (
+                <div className="space-y-1.5" aria-live="polite">
+                  <div className="flex items-baseline justify-between">
+                    <span className="faint">上游锁定中，暂不可取消</span>
+                    <span className="tnum text-sm font-medium" style={{ color: "rgb(var(--warn))" }}>
+                      {formatCountdown(cancelLeft)}
+                    </span>
+                  </div>
+                  <div className="progress-track">
+                    <div
+                      className="progress-fill"
+                      style={{
+                        width: `${
+                          cancelTotal && cancelTotal > 0
+                            ? Math.max(0, Math.min(100, ((cancelTotal - cancelLeft) / cancelTotal) * 100))
+                            : 0
+                        }%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </div>
           )}
 
           {running && !poll?.code ? (
-            <div className="space-y-1">
+            <div className="space-y-2">
               <button
                 type="button"
                 className="btn btn-danger"
@@ -493,15 +623,34 @@ export default function ShopPage() {
                 {cancelLabel}
               </button>
               {cancelPending ? (
-                <p className="text-xs text-slate-500">上游取号后约 60 秒内不允许取消</p>
-              ) : null}
+                <p className="faint">上游取号后约 60 秒内不允许取消，倒计时归零后按钮会自动启用。</p>
+              ) : (
+                <p className="faint">取消成功后，本次预扣金额会全额回补到卡密余额。</p>
+              )}
             </div>
           ) : null}
         </section>
       ) : null}
 
-      {notice ? <p className="text-sm text-emerald-300">{notice}</p> : null}
-      {error ? <p className="text-sm text-rose-400">{error}</p> : null}
+      {notice ? (
+        <p
+          className="text-sm"
+          role="status"
+          aria-live="polite"
+          style={{ color: "rgb(var(--ok))" }}
+        >
+          {notice}
+        </p>
+      ) : null}
+      {error ? (
+        <p
+          className="card text-sm"
+          role="alert"
+          style={{ borderColor: "rgb(var(--danger) / 0.4)", color: "rgb(var(--danger))" }}
+        >
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }

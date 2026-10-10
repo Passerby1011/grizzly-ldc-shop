@@ -1,3 +1,5 @@
+/** 管理台视图类型。字段名与 API 响应保持一致（金额一律字符串，前端不做浮点运算）。 */
+
 export interface PoolView {
   realBalanceUsd: string;
   allocatedUsd: string;
@@ -72,18 +74,89 @@ export interface IssueKeysView {
   notice: string;
 }
 
-export interface KeyListView {
-  keys: Array<{
-    id: string;
-    codePrefix: string;
-    faceUsd: string;
-    balanceUsd: string;
-    status: string;
-    note: string | null;
-    outTradeNo: string | null;
-    createdAt: string;
-  }>;
-  count: number;
+/** 分页信封：所有列表接口统一这个形状。 */
+export interface Paged<T> {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface KeyRow {
+  id: string;
+  codePrefix: string;
+  faceUsd: string;
+  balanceUsd: string;
+  status: string;
+  note: string | null;
+  outTradeNo: string | null;
+  createdAt: string;
+  expiresAt: string | null;
+}
+
+export type KeyListView = Paged<never> & { keys: KeyRow[] };
+
+export interface OrderRow {
+  id: string;
+  outTradeNo: string;
+  ldcTradeNo: string | null;
+  gateway: string;
+  name: string;
+  amountLdc: string;
+  faceUsd: string;
+  status: string;
+  paidAt: string | null;
+  createdAt: string;
+  keyPrefix: string | null;
+  keyStatus: string | null;
+}
+
+export type OrderListView = Paged<never> & { orders: OrderRow[] };
+
+export interface ActivationRow {
+  id: string;
+  keyPrefix: string | null;
+  grizzlyId: string;
+  service: string;
+  country: string;
+  phone: string;
+  reservedUsd: string;
+  costUsd: string | null;
+  status: string;
+  hasCode: boolean;
+  createdAt: string;
+  closedAt: string | null;
+}
+
+export type ActivationListView = Paged<never> & { activations: ActivationRow[] };
+
+export interface LedgerRow {
+  id: string;
+  keyId: string;
+  keyPrefix: string | null;
+  deltaUsd: string;
+  balanceAfter: string;
+  reason: string;
+  refId: string | null;
+  createdAt: string;
+}
+
+export type LedgerListView = Paged<never> & { entries: LedgerRow[] };
+
+/** 设置面板：生效值 / 环境变量回退值 / 库里显式覆盖了哪些键。 */
+export interface SiteSettingsValues {
+  rateLdcPerUsd: string;
+  markupPct: number;
+  cancelLockSeconds: number;
+  safetyBufferUsd: string;
+  faceValuePresets: number[];
+}
+
+export interface SettingsView {
+  effective: SiteSettingsValues;
+  envFallback: SiteSettingsValues;
+  fromDb: Record<string, string>;
+  hints: Record<string, string>;
 }
 
 export interface ReconcileView {
