@@ -80,29 +80,35 @@ describe("country-names.zh 补齐表卫生", () => {
 
 describe("displayServiceName（词典 → 上游自带中文 → 英文回退 → code 兜底）", () => {
   it("命中词典的实测 code 返回中文名", () => {
+    /*
+     * 只列「官方给了中文名」的 code。
+     * wa / ig / fb 官方原名就是英文，不进词典 —— 词典里塞了条目会覆盖官方更新。
+     */
     const cases: Array<[string, string]> = [
       ["tg", "电报"],
-      ["wa", "WhatsApp"],
       ["wb", "微信"],
       ["zs", "哔哩哔哩"],
       ["qf", "小红书"],
-      ["lf", "TikTok"],
       ["mb", "雅虎"],
-      ["ig", "Instagram"],
-      ["fb", "脸谱"],
       ["dr", "AI 聊天"],
       ["ub", "优步"],
       ["am", "亚马逊"],
       ["hw", "支付宝"],
       ["aon", "币安"],
-      ["aor", "OKX"],
-      ["mt", "Steam"],
-      ["ts", "PayPal"],
-      ["dh", "eBay"],
-      ["gr_sg", "Signal"],
+      ["mt", "蒸汽平台"],
+      ["ts", "贝宝"],
+      ["dh", "易趣"],
+      ["vp", "快手"],
+      ["ccw", "夸克"],
     ];
     for (const [code, expected] of cases) {
       expect(displayServiceName(code, "ignored-upstream-name"), `${code} 应显示 ${expected}`).toBe(expected);
+    }
+  });
+
+  it("官方本就是英文原名的 code 不占词典条目（跟随官方更新）", () => {
+    for (const code of ["wa", "ig", "fb", "nv", "tme", "lf"]) {
+      expect(SERVICE_NAMES_ZH[code], `${code} 官方无中文，不应进词典`).toBeUndefined();
     }
   });
 
@@ -135,15 +141,24 @@ describe("displayServiceName（词典 → 上游自带中文 → 英文回退 �
 
 describe("词典卫生（负向断言：推测 code 必须不存在）", () => {
   it("不含被实测证伪的推测 code", () => {
-    // 这些曾是推测值，实测在 getServicesList 里要么不存在、要么张冠李戴
-    const provedWrong = ["tt", "wx", "st", "pp", "aa", "line", "telegram", "whatsapp", "google", "twitter", "discord"];
+    /*
+     * 这些曾是推测值，实测在 getServicesList 里不存在或张冠李戴。
+     * 注意：st / pp 现在**确实是真实 code**（st=欧尚 Auchan、pp=虎牙 Huya），
+     * 当年把它们当 Steam/PayPal 是错的，但 code 本身存在，所以不在此列。
+     */
+    const provedWrong = ["tt", "wx", "aa", "line", "telegram", "whatsapp", "google", "twitter", "discord"];
     for (const code of provedWrong) {
       expect(SERVICE_NAMES_ZH[code], `${code} 是推测值，不应存在于词典（会掩盖真实 code）`).toBeUndefined();
     }
   });
 
   it("实测 code 必须存在，防止有人误删", () => {
-    const mustExist = ["tg", "wa", "wb", "lf", "mt", "ts", "zs", "qf", "mb", "dr", "am", "ub", "hw", "aon", "aor", "dh", "gr_sg", "ig", "fb", "nv", "tme", "go"];
+    /*
+     * 只列「官方给了中文名」的 code。
+     * wa / ig / fb / nv / tme / go 官方本来就是英文原名，不进词典 —— 硬塞条目
+     * 反而会覆盖官方更新（官方改名后我们还显示旧中文）。
+     */
+    const mustExist = ["tg", "wb", "mt", "ts", "zs", "qf", "mb", "dr", "am", "ub", "hw", "aon", "dh", "vp", "ccw"];
     for (const code of mustExist) {
       expect(SERVICE_NAMES_ZH[code], `${code} 是实测 code，必须保留`).toBeTruthy();
     }
