@@ -7,18 +7,37 @@
  * 那种"断言错误答案存在"的测试会给出虚假安全感，比没有测试更危险——已在下方改为负向断言。
  */
 import { describe, expect, it } from "vitest";
+import { COUNTRY_NAMES_ZH } from "../country-names.zh";
 import { displayCountryName, displayServiceName, SERVICE_NAMES_ZH } from "../service-names.zh";
 
-describe("displayCountryName（优先 chn → 回退 eng）", () => {
-  it("上游有中文名时用中文", () => {
+describe("displayCountryName（上游 chn → 本地补齐 → 英文）", () => {
+  it("上游有中文名时优先用官方的", () => {
     expect(displayCountryName("Ukraine", "乌克兰")).toBe("乌克兰");
     expect(displayCountryName("United States", "美国")).toBe("美国");
     expect(displayCountryName("Ukraine", "  乌克兰  ")).toBe("乌克兰");
   });
 
-  it("没有 chn 时回退 eng", () => {
-    expect(displayCountryName("Ukraine")).toBe("Ukraine");
-    expect(displayCountryName("Ukraine", "")).toBe("Ukraine");
+  it("上游 chn 为空时用本地补齐表（实测 104 个国家上游没给中文）", () => {
+    // 这些是实测 chn 为空、必须靠本地表兜住的
+    expect(displayCountryName("Denmark", "")).toBe("丹麦");
+    expect(displayCountryName("Finland", "")).toBe("芬兰");
+    expect(displayCountryName("Ecuador", "")).toBe("厄瓜多尔");
+    expect(displayCountryName("Togo", "")).toBe("多哥");
+    expect(displayCountryName("Kuwait", "")).toBe("科威特");
+    expect(displayCountryName("Fiji", "")).toBe("斐济");
+    expect(displayCountryName("Switzerland", "")).toBe("瑞士");
+    expect(displayCountryName("Norway", "")).toBe("挪威");
+    expect(displayCountryName("Australia", "")).toBe("澳大利亚");
+  });
+
+  it("本地表不得覆盖上游官方译名", () => {
+    // 上游给什么就用什么，哪怕和本地表不同
+    expect(displayCountryName("Denmark", "丹麥（官方）")).toBe("丹麥（官方）");
+  });
+
+  it("本地表也没有时回退英文", () => {
+    expect(displayCountryName("Atlantis")).toBe("Atlantis");
+    // Ukraine 上游 chn 有中文（不在本地补齐表里），chn 为空时只能回退英文
     expect(displayCountryName("Ukraine", "   ")).toBe("Ukraine");
   });
 
@@ -26,6 +45,24 @@ describe("displayCountryName（优先 chn → 回退 eng）", () => {
     const out = displayCountryName("", "");
     expect(out).toBeTruthy();
     expect(out).not.toContain("undefined");
+  });
+});
+
+describe("country-names.zh 补齐表卫生", () => {
+  it("条目数与实测缺口一致（103 个真实国家 + 不含哨兵）", () => {
+    expect(Object.keys(COUNTRY_NAMES_ZH).length).toBe(103);
+  });
+
+  it("不含哨兵 ANY_COUNTRY", () => {
+    expect(COUNTRY_NAMES_ZH["ANY_COUNTRY"]).toBeUndefined();
+    expect(COUNTRY_NAMES_ZH["999999"]).toBeUndefined();
+  });
+
+  it("所有值都是中文且非空", () => {
+    for (const [eng, zh] of Object.entries(COUNTRY_NAMES_ZH)) {
+      expect(zh.trim(), `${eng} 的译名不应为空`).not.toBe("");
+      expect(/[\u4e00-\u9fff]/.test(zh), `${eng} -> ${zh} 应为中文`).toBe(true);
+    }
   });
 });
 

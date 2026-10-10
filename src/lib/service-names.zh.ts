@@ -13,6 +13,7 @@
  *   `lf` 实际是 TikTok、TikTok 的 code 是 lf；LINE 在列表里没有独立服务项。
  * 修正记录见本文件下方 CHANGELOG。
  */
+import { COUNTRY_NAMES_ZH } from "./country-names.zh";
 
 /** 服务中文名映射。键为 Grizzly service code（实测值）。 */
 export const SERVICE_NAMES_ZH: Record<string, string> = {
@@ -69,6 +70,25 @@ export const SERVICE_NAMES_ZH: Record<string, string> = {
 const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 
 /**
+ * 取国家展示名，三层兜底：
+ *   1. 上游 `chn` 有中文 → 用官方的（实测 102 个国家有）
+ *   2. 否则查本地补齐表（实测另 104 个上游 `chn` 为空，见 country-names.zh.ts）
+ *   3. 再回退英文 `eng`，最后兜底「未知地区」
+ *
+ * ⚠️ 顺序不能颠倒：绝不拿本地译名盖掉上游官方译名。
+ */
+export function displayCountryName(eng: string, chn?: string): string {
+  const zh = typeof chn === "string" ? chn.trim() : "";
+  if (zh) return zh;
+
+  const en = typeof eng === "string" ? eng.trim() : "";
+  const local = en ? COUNTRY_NAMES_ZH[en] : undefined;
+  if (local) return local;
+
+  return en || "未知地区";
+}
+
+/**
  * 取展示名，四层兜底：
  *   1. 词典命中 → 中文
  *   2. 上游 name 含 CJK → 原样用（实测 52 个服务自带中文名）
@@ -85,11 +105,4 @@ export function displayServiceName(code: string, upstreamName: string): string {
   if (name && CJK_PATTERN.test(name)) return name;
 
   return name || key || "未知服务";
-}
-
-/** 取国家展示名：优先 chn → 回退 eng。 */
-export function displayCountryName(eng: string, chn?: string): string {
-  const zh = typeof chn === "string" ? chn.trim() : "";
-  const en = typeof eng === "string" ? eng.trim() : "";
-  return zh || en || "未知地区";
 }
