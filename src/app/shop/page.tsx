@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { displayCountryName, displayServiceName, hasChineseName } from "@/lib/service-names.zh";
+import { SearchablePicker } from "./_components/SearchablePicker";
 import { ApiCallError, apiGet, apiPost, errorMessage } from "./_api";
 import type {
   ActivationView,
@@ -487,28 +488,26 @@ export default function ShopPage() {
                   value={countryFilter}
                   onChange={(event) => setCountryFilter(event.target.value)}
                 />
-                <select
+                <SearchablePicker
                   id="country"
-                  className="input"
-                  size={8}
                   value={country}
-                  aria-label="国家"
-                  onChange={(event) => {
-                    setCountry(event.target.value);
+                  placeholder="请选择国家"
+                  rows={7}
+                  footer={
+                    countryFilter.trim()
+                      ? `匹配到 ${filteredCountries.length} 个`
+                      : `共 ${filteredCountries.length} 个，常用国家已置顶`
+                  }
+                  options={filteredCountries.map((item) => ({
+                    value: String(item.id),
+                    label: `${item.name ?? displayCountryName(item.eng, item.chn)}（#${item.id}）`,
+                    pinned: PINNED_COUNTRY_IDS.includes(item.id),
+                  }))}
+                  onSelect={(next) => {
+                    setCountry(next);
                     setQuote(null);
                   }}
-                >
-                  {country && !filteredCountries.some((c) => String(c.id) === country) ? (
-                    <option value={country}>
-                      {(countries.find((c) => String(c.id) === country)?.name ?? country) + `（#${country}）`}
-                    </option>
-                  ) : null}
-                  {filteredCountries.map((item) => (
-                    <option key={item.id} value={String(item.id)}>
-                      {item.name ?? displayCountryName(item.eng, item.chn)}（#{item.id}）
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
               <div>
                 <label className="label" htmlFor="serviceFilter">
@@ -521,32 +520,24 @@ export default function ShopPage() {
                   value={serviceFilter}
                   onChange={(event) => setServiceFilter(event.target.value)}
                 />
-                <select
-                  className="input"
-                  size={8}
+                <SearchablePicker
                   value={service}
-                  aria-label="服务"
-                  onChange={(event) => {
-                    setService(event.target.value);
+                  placeholder="请选择服务"
+                  rows={7}
+                  footer={
+                    serviceFilter.trim()
+                      ? `匹配到 ${filteredServices.length} 个`
+                      : `默认列出 ${filteredServices.length} 个中文服务；英文或冷门服务请直接搜索（覆盖全部 ${services.length} 个）`
+                  }
+                  options={filteredServices.map((item) => ({
+                    value: item.code,
+                    label: `${displayServiceName(item.code, item.name)}（${item.code}）`,
+                  }))}
+                  onSelect={(next) => {
+                    setService(next);
                     setQuote(null);
                   }}
-                >
-                  {service && !filteredServices.some((s) => s.code === service) ? (
-                    <option value={service}>
-                      {(services.find((s) => s.code === service)?.name ?? service) + `（${service}）`}
-                    </option>
-                  ) : null}
-                  {filteredServices.map((item) => (
-                    <option key={item.code} value={item.code}>
-                      {displayServiceName(item.code, item.name)}（{item.code}）
-                    </option>
-                  ))}
-                </select>
-                <p className="faint mt-1 text-xs">
-                  {serviceFilter.trim()
-                    ? `匹配到 ${filteredServices.length} 个`
-                    : `默认列出 ${filteredServices.length} 个中文服务；英文或冷门服务请直接搜索（覆盖全部 ${services.length} 个）`}
-                </p>
+                />
               </div>
             </div>
 
