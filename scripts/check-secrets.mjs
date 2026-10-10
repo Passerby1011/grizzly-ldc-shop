@@ -46,14 +46,18 @@ for (const f of files) {
   if (/[0-9a-f]{64}/i.test(body)) {
     problems.push(`${f}: 疑似 64 位十六进制密钥`);
   }
-  // 赋值给敏感变量的非占位值
-  const secretAssign = /(GRIZZLY_API_KEY|LDC_KEY|LDC_PID|LDC_PRIVATE_KEY_B64|ADMIN_TOKEN|CRON_SECRET|UPSTASH_REDIS_REST_TOKEN|DATABASE_URL)\s*[=:]\s*["']?([^\s"']{12,})/g;
+  // 赋值给敏感变量的**带引号字面量**（避免把 zod 声明如 `z.string()` 误判）
+  const secretAssign = /(GRIZZLY_API_KEY|LDC_KEY|LDC_PID|LDC_PRIVATE_KEY_B64|ADMIN_TOKEN|CRON_SECRET|UPSTASH_REDIS_REST_TOKEN)\s*[=:]\s*["']([^"'\s]{16,})["']/g;
   for (const m of body.matchAll(secretAssign)) {
     const v = m[2];
     if (/^(your_|change_me|postgresql:\/\/user|postgresql:\/\/shop|xxx|placeholder)/i.test(v)) continue;
     if (/^env\(|^\$\{|^process\.env/.test(v)) continue;
-    if (m[1] === "DATABASE_URL" && /localhost|@host|:5432\/db/.test(v)) continue;
     problems.push(`${f}: ${m[1]} 出现疑似真实值`);
+  }
+  // DATABASE_URL 只在出现真实口令形态时报（localhost / 占位符放行）
+  const dbUrl = body.match(/DATABASE_URL\s*[=:]\s*["']([^"'\s]{16,})["']/);
+  if (dbUrl && !/(localhost|@host|:5432\/db|user:pass|USER:PASSWORD)/i.test(dbUrl[1])) {
+    problems.push(`${f}: DATABASE_URL 出现疑似真实连接串`);
   }
   // 常见 token 前缀
   if (/\b(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,})\b/.test(body)) {
