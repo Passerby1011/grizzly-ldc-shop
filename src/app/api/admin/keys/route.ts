@@ -1,13 +1,8 @@
 import { z } from "zod";
-import {
-  jsonOk,
-  readJsonBody,
-  requireBearer,
-  withRoute,
-  getSearchParams,
-} from "@/lib/http";
-import { getConfig } from "@/lib/config";
+import { requireAdmin } from "@/lib/admin";
 import { getPrisma } from "@/lib/db";
+import { jsonOk, readJsonBody, requireBearer, withRoute, getSearchParams } from "@/lib/http";
+import { getConfig } from "@/lib/config";
 import { dec } from "@/lib/money";
 import { issueCardKeys, MAX_KEYS_PER_BATCH, type PoolState } from "@/lib/pool";
 
@@ -19,6 +14,9 @@ const BodySchema = z.object({
   count: z.coerce.number().int().min(1).max(MAX_KEYS_PER_BATCH),
   note: z.string().max(200).optional(),
 });
+
+const PAGE_SIZE_DEFAULT = 20;
+const PAGE_SIZE_MAX = 100;
 
 function serializePool(pool: PoolState) {
   return {
@@ -35,11 +33,13 @@ function serializePool(pool: PoolState) {
 export const POST = withRoute(async (request: Request) => {
   requireBearer(request, getConfig().ADMIN_TOKEN, "管理口令错误");
   const body = await readJsonBody(request, BodySchema);
+
   const result = await issueCardKeys({
     faceUsd: body.faceUsd,
     count: body.count,
     note: body.note ?? null,
   });
+
   return jsonOk({
     keys: result.keys,
     totalFaceUsd: result.totalFaceUsd,
@@ -48,19 +48,35 @@ export const POST = withRoute(async (request: Request) => {
   });
 });
 
-/** 卡密列表（不含明文）。 */
+/** 卡密列表（分页，不含明文）。 */
 export const GET = withRoute(async (request: Request) => {
-  requireBearer(request, getConfig().ADMIN_TOKEN, "管理口令错误");
+  requireAdmin(request);
   const params = getSearchParams(request);
-  const limit = Math.min(Math.max(Number(params.get("limit") ?? 50) || 50, 1), 200);
-  const status = params.get("status");
 
-  const keys = await getPrisma().cardKey.findMany({
-    where: status ? { status } : undefined,
-    orderBy: { createdAt: "desc" },
-    take: limit,
-    include: { order: { select: { outTradeNo: true } } },
-  });
+  const page = Math.max(1, Number(params.get("page") ?? 1) || 1);
+  const pageSize = Math.min(
+    Math.max(Number(params.get("pageSize") ?? PAGE_SIZE_DEFAULT) || PAGE_SIZE_DEFAULT, 1),
+    PAGE_SIZE_MAX,
+  );
+  const status = params.get("status") || undefined;
+  const search = (params.get("q") || "").trim();
+
+  const where = {
+    ...(status ? { status } : {}),
+    ...(search ? { codePrefix: { contains: search, mode: "insensitive" as const } } : {}),
+  };
+
+  const prisma = getPrisma();
+  const [total, keys] = await Promise.all([
+    prisma.cardKey.count({ where }),
+    prisma.cardKey.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      include: { order: { select: { outTradeNo: true } } },
+    }),
+  ]);
 
   return jsonOk({
     keys: keys.map((key) => ({
@@ -74,6 +90,9 @@ export const GET = withRoute(async (request: Request) => {
       createdAt: key.createdAt.toISOString(),
       expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null,
     })),
-    count: keys.length,
+    page,
+    pageSize,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
   });
 });
