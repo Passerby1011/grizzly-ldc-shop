@@ -143,3 +143,13 @@ model PriceCache {
 
   @@unique([service, country])
 }
+
+/// 可热改的站点设置（优先于环境变量）。
+///
+/// 为什么有这张表：Vercel 上改环境变量必须重新部署，老板要的是「后台点一下就能改」。
+/// 读取优先级固定为：Setting 表 > 环境变量 > 硬编码默认。
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
