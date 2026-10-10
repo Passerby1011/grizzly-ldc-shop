@@ -1,8 +1,7 @@
 import { z } from "zod";
 import { requireAdmin } from "@/lib/admin";
 import { getPrisma } from "@/lib/db";
-import { jsonOk, readJsonBody, requireBearer, withRoute, getSearchParams } from "@/lib/http";
-import { getConfig } from "@/lib/config";
+import { jsonOk, readJsonBody, withRoute, getSearchParams } from "@/lib/http";
 import { dec } from "@/lib/money";
 import { issueCardKeys, MAX_KEYS_PER_BATCH, type PoolState } from "@/lib/pool";
 
@@ -31,7 +30,7 @@ function serializePool(pool: PoolState) {
 
 /** 生成卡密：先校验可用池，不足返回 409；明文只在这里返回一次。 */
 export const POST = withRoute(async (request: Request) => {
-  requireBearer(request, getConfig().ADMIN_TOKEN, "管理口令错误");
+  requireAdmin(request);
   const body = await readJsonBody(request, BodySchema);
 
   const result = await issueCardKeys({

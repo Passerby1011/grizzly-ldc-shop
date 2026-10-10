@@ -1,5 +1,5 @@
-import { jsonOk, requireBearer, withRoute } from "@/lib/http";
-import { getConfig } from "@/lib/config";
+import { jsonOk, withRoute } from "@/lib/http";
+import { requireAdmin } from "@/lib/admin";
 import { getPrisma } from "@/lib/db";
 import { dec, formatUsd } from "@/lib/money";
 import { getConsumedUsd, getPoolState } from "@/lib/pool";
@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 
 /** 余额 / 已售未消耗 / 可用池 / 订单与激活统计。 */
 export const GET = withRoute(async (request: Request) => {
-  requireBearer(request, getConfig().ADMIN_TOKEN, "管理口令错误");
+  requireAdmin(request);
   const prisma = getPrisma();
 
   const [pool, consumed, keyGroups, orderGroups, activationGroups, paidOrders, recentOrders, recentActivations, lastRun, lastSnapshot] =

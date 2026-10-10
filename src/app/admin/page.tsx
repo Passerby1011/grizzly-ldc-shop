@@ -976,11 +976,10 @@ export default function AdminPage() {
           </button>
         ))}
       </nav>
-
-      {tab === "overview" ? <OverviewTab refreshKey={refreshKey} /> : null}
-      {tab === "keys" ? <KeysTab /> : null}
-      {tab === "records" ? <RecordsTab /> : null}
-      {tab === "settings" ? <SettingsTab onSaved={() => setRefreshKey((n) => n + 1)} /> : null}
+      {tab === "overview" ? <OverviewTab key="overview" refreshKey={refreshKey} /> : null}
+      {tab === "keys" ? <KeysTab key="keys" /> : null}
+      {tab === "records" ? <RecordsTab key="records" /> : null}
+      {tab === "settings" ? <SettingsTab key="settings" onSaved={() => setRefreshKey((n) => n + 1)} /> : null}
     </div>
   );
 }
