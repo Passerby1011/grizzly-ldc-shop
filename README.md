@@ -121,8 +121,23 @@ git config core.hooksPath .githooks
    | `NEXT_PUBLIC_APP_URL` | 站点对外地址（决定 `notify_url` 与 Cookie 的 Secure 标记） |
    | `CRON_SECRET` | Cron 鉴权口令 |
 
-5. **Cron**：仓库根的 `vercel.json` 已声明 `GET /api/cron/reconcile`（每小时一次），
-   Vercel 会自动带 `Authorization: Bearer $CRON_SECRET` 调用。
+5. **Cron**：仓库根的 `vercel.json` 声明了 `GET /api/cron/reconcile`（**每天 03:00 一次**）。
+   Vercel 会自动带 `Authorization: Bearer CRON_SECRET` 调用。
+
+   > ⚠️ **Hobby 套餐限制**：Vercel 免费版每个 cron **每天最多跑 1 次**，写 `0 * * * *` 之类的
+   > 更频繁表达式会**直接导致部署被拒**（报错 `Hobby accounts are limited to daily cron jobs`）。
+   > 因此仓库里的表达式固定为每日一次。
+   >
+   > **需要更频繁的对账**（设计目标是 5~15 分钟一次）时，不要改这个表达式升级套餐，
+   > 改用**外部定时器**打同一个端点即可（免费）：
+   >
+   > ```
+   > GET https://<你的域名>/api/cron/reconcile
+   > Authorization: Bearer <CRON_SECRET>
+   > ```
+   >
+   > 可用 cron-job.org、Upstash QStash 等，间隔设 5~15 分钟。两条路径可以并存，互不冲突。
+   > 另注：Hobby 的函数超时上限是 10 秒，该端点只做几次上游查询，正常在 10 秒内完成。
 6. **回调地址**：把 `NEXT_PUBLIC_APP_URL` 配成正式域名，`notify_url` 会自动变成
    `https://<域名>/api/pay/notify`，再把它填到 LDC 商户后台。
 
