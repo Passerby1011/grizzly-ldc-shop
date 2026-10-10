@@ -70,22 +70,45 @@ export const SERVICE_NAMES_ZH: Record<string, string> = {
 const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 
 /**
+ * 归一化上游字段。
+ *
+ * ⚠️ 实测坑（2026-10-10）：上游部分国家的 `eng` / `chn` 值**自带首尾双引号**，
+ * 例如 `eng` 实际是 `"Denmark"`（含引号），`chn` 也被填成了同样的英文原文而非中文。
+ * 不剥引号会导致：查表查不中、`chn` 判空误判（把英文当中文用）。
+ */
+function clean(value: unknown): string {
+  if (typeof value !== "string") return "";
+  let s = value.trim();
+  // 剥掉可能存在的成对引号（可能嵌套一层）
+  for (let i = 0; i < 2; i += 1) {
+    if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) {
+      s = s.slice(1, -1).trim();
+    } else break;
+  }
+  return s;
+}
+
+/**
  * 取国家展示名，三层兜底：
- *   1. 上游 `chn` 有中文 → 用官方的（实测 102 个国家有）
- *   2. 否则查本地补齐表（实测另 104 个上游 `chn` 为空，见 country-names.zh.ts）
+ *   1. 上游 `chn` 有**中文** → 用官方的（实测只有 102 个真有中文）
+ *   2. 否则查本地补齐表（其余 104 个上游没给中文）
  *   3. 再回退英文 `eng`，最后兜底「未知地区」
  *
- * ⚠️ 顺序不能颠倒：绝不拿本地译名盖掉上游官方译名。
+ * ⚠️ 顺序不能颠倒：绝不用本地译名覆盖上游官方译名。
  */
 export function displayCountryName(eng: string, chn?: string): string {
-  const zh = typeof chn === "string" ? chn.trim() : "";
-  if (zh) return zh;
+  const zh = clean(chn);
+  // 上游 chn 有时被填成英文原文，必须确认真的是中文才采用
+  if (zh && CJK_PATTERN.test(zh)) return zh;
 
-  const en = typeof eng === "string" ? eng.trim() : "";
+  const en = clean(eng);
+  /* 999999 = ANY_COUNTRY，是"任意国家"哨兵不是真国家 */
+  if (en === "ANY_COUNTRY") return "任意国家";
+
   const local = en ? COUNTRY_NAMES_ZH[en] : undefined;
   if (local) return local;
 
-  return en || "未知地区";
+  return en || zh || "未知地区";
 }
 
 /**

@@ -14,6 +14,8 @@ export interface CountryView {
   chn?: string;
   rus?: string;
   visible: number;
+  /** 服务端算好的展示名（上游 chn → 本地补齐表 → eng）。优先用它，别在前端重算。 */
+  name?: string;
 }
 
 export interface ServiceView {

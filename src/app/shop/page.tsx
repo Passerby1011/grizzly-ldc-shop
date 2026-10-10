@@ -393,7 +393,7 @@ export default function ShopPage() {
                   <option value="">请选择…</option>
                   {countries.map((item) => (
                     <option key={item.id} value={String(item.id)}>
-                      {displayCountryName(item.eng, item.chn)}（#{item.id}）
+                      {item.name ?? displayCountryName(item.eng, item.chn)}（#{item.id}）
                     </option>
                   ))}
                 </select>

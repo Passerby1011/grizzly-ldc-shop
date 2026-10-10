@@ -30,8 +30,16 @@ describe("displayCountryName（上游 chn → 本地补齐 → 英文）", () =>
     expect(displayCountryName("Australia", "")).toBe("澳大利亚");
   });
 
-  it("本地表不得覆盖上游官方译名", () => {
-    // 上游给什么就用什么，哪怕和本地表不同
+  it("剥掉上游自带的成对引号再查表（实测坑：eng 实际是 \"Denmark\"）", () => {
+    expect(displayCountryName('"Denmark"', '"Denmark"')).toBe("丹麦");
+    expect(displayCountryName("'Finland'", "")).toBe("芬兰");
+  });
+
+  it("上游 chn 被填成英文原文时不得当中文采用", () => {
+    // 实测：chn 可能等于英文名而非中文，必须靠 CJK 判定拦下并走本地表
+    expect(displayCountryName("Denmark", "Denmark")).toBe("丹麦");
+    expect(displayCountryName("Finland", "Finland")).toBe("芬兰");
+    // 真中文才采用（哪怕和本地表不同）
     expect(displayCountryName("Denmark", "丹麥（官方）")).toBe("丹麥（官方）");
   });
 
@@ -45,6 +53,10 @@ describe("displayCountryName（上游 chn → 本地补齐 → 英文）", () =>
     const out = displayCountryName("", "");
     expect(out).toBeTruthy();
     expect(out).not.toContain("undefined");
+  });
+
+  it("ANY_COUNTRY 哨兵显示为「任意国家」", () => {
+    expect(displayCountryName("ANY_COUNTRY")).toBe("任意国家");
   });
 });
 
