@@ -512,7 +512,7 @@ export default function ShopPage() {
               </div>
               <div>
                 <label className="label" htmlFor="serviceFilter">
-                  服务（可搜索，支持中文 / 英文 / code）
+                  服务（可搜索，全部 {services.length} 个）
                 </label>
                 <input
                   id="serviceFilter"
@@ -542,6 +542,11 @@ export default function ShopPage() {
                     </option>
                   ))}
                 </select>
+                <p className="faint mt-1 text-xs">
+                  {serviceFilter.trim()
+                    ? `匹配到 ${filteredServices.length} 个`
+                    : `默认列出 ${filteredServices.length} 个中文服务；英文或冷门服务请直接搜索（覆盖全部 ${services.length} 个）`}
+                </p>
               </div>
             </div>
 

@@ -185,4 +185,25 @@ describe("hasChineseName —— 决定接码台默认列表", () => {
   it("有词典条目时，即使上游名是英文也返回 true（词典优先）", () => {
     expect(hasChineseName("tg", "SomeEnglishName")).toBe(true);
   });
+
+  /*
+   * 回归：日文假名 / 韩文谚文不是中文。
+   * CJK_PATTERN 含 \u3040-\u30ff（假名）与 \uac00-\ud7af（谚文），
+   * 起初 hasChineseName 直接复用它，导致 "ジモティー"、"ハピタス" 这类
+   * 纯日文服务混进默认列表 —— 实测 2488 条里误收 8 条。
+   */
+  it("纯日文假名不算中文（上游实测样本）", () => {
+    expect(hasChineseName("jmty", "Jimoty / ジモティー")).toBe(false);
+    expect(hasChineseName("krsh", "クラシル (Kurashiru)")).toBe(false);
+    expect(hasChineseName("hpts", "ハピタス")).toBe(false);
+    expect(hasChineseName("pdpd", "ペイディ/ Paidy")).toBe(false);
+  });
+
+  it("含汉字的日文服务仍算中文（有汉字就能认）", () => {
+    expect(hasChineseName("rbnt", "日本トレカセンター")).toBe(true);
+  });
+
+  it("纯韩文谚文不算中文", () => {
+    expect(hasChineseName("zzz997", "카카오톡")).toBe(false);
+  });
 });

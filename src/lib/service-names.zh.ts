@@ -70,6 +70,12 @@ export const SERVICE_NAMES_ZH: Record<string, string> = {
 const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 
 /**
+ * 汉字（不含日文假名 / 韩文谚文）。
+ * 「是不是中文」用这个；判断要不要原样沿用上游名才用 CJK_PATTERN。
+ */
+const HAN_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+
+/**
  * 归一化上游字段。
  *
  * ⚠️ 实测坑（2026-10-10）：上游部分国家的 `eng` / `chn` 值**自带首尾双引号**，
@@ -127,7 +133,7 @@ export function displayCountryName(eng: string, chn?: string): string {
  * 默认铺满英文列表既看不懂也找不到目标；要什么直接搜，搜索覆盖全部。
  */
 export function hasChineseName(code: string, upstreamName: string): boolean {
-  return CJK_PATTERN.test(displayServiceName(code, upstreamName));
+  return HAN_PATTERN.test(displayServiceName(code, upstreamName));
 }
 
 export function displayServiceName(code: string, upstreamName: string): string {
