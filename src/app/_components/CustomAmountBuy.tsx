@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * 自定义充值：任意金额（0.1 步长）。
+ * 自定义充值：任意金额（0.01 步长）。
  *
  * 报价一律回服务端算（/api/pay/quote），因为 LDC 金额是「向上取整到 2 位」，
  * 用 JS 浮点在前端复算会出现「显示 3.31、实收 3.30」这类偏差。
@@ -18,8 +18,8 @@ interface Quote {
   amountLdc?: string;
 }
 
-const STEP = "0.1";
-const QUICK_ADD = ["1", "5", "10"] as const;
+const STEP = "0.01";
+const QUICK_ADD = ["0.01", "0.1", "1", "5"] as const;
 
 /** 把输入收敛成「最多一位小数」的字符串，顺便挡掉明显非法的字符。 */
 function sanitize(raw: string): string {
@@ -28,8 +28,8 @@ function sanitize(raw: string): string {
   const firstDot = s.indexOf(".");
   if (firstDot >= 0) {
     s = s.slice(0, firstDot + 1) + s.slice(firstDot + 1).replace(/\./g, "");
-    /* 小数最多一位（步长 0.1） */
-    s = s.slice(0, firstDot + 2);
+    /* 小数最多两位（步长 0.01） */
+    s = s.slice(0, firstDot + 3);
   }
   /* 去掉多余前导零：007 → 7（但保留 0.5 这种） */
   if (/^0\d/.test(s)) s = s.replace(/^0+/, "");
@@ -75,7 +75,7 @@ export function CustomAmountBuy() {
   const add = useCallback((delta: string) => {
     setInput((prev) => {
       const base = Number(prev || "0");
-      const next = Math.round((base + Number(delta)) * 10) / 10;
+      const next = Math.round((base + Number(delta)) * 100) / 100;
       return next > 0 ? String(next) : "";
     });
   }, []);

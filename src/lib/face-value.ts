@@ -11,7 +11,7 @@ import { dec, type Decimal, type DecimalInput } from "./money";
 import { MAX_FACE_USD, MIN_FACE_USD } from "./pool";
 
 /** 自定义充值的最小单位（美元）。用户可任意填写，但必须是这个值的整数倍。 */
-export const CUSTOM_FACE_STEP_USD = "0.1";
+export const CUSTOM_FACE_STEP_USD = "0.01";
 
 /** 自定义充值的最小金额：一个步长。 */
 export const MIN_CUSTOM_FACE_USD = CUSTOM_FACE_STEP_USD;
@@ -32,7 +32,7 @@ export interface FaceAmountCheck {
  *   2. > 0
  *   3. >= MIN_FACE_USD（0.01，池子的硬下限）
  *   4. <= MAX_FACE_USD（1000）
- *   5. 必须是 CUSTOM_FACE_STEP_USD（0.1）的整数倍
+ *   5. 必须是 CUSTOM_FACE_STEP_USD（0.01）的整数倍
  *
  * 注意第 3 与第 5 条叠加后，买家实际能填的最小值是 0.1；
  * MIN_FACE_USD 保留 0.01 是给后台发卡用的（后台可发更细的面值）。
@@ -57,13 +57,13 @@ export function checkFaceAmount(input: DecimalInput): FaceAmountCheck {
   /* 步长校验：用 Decimal 除法判断是否整除，避免浮点余数误判 */
   const units = value.div(CUSTOM_FACE_STEP_USD);
   if (!units.isInteger()) {
-    return { ok: false, value, reason: `金额必须是 ${CUSTOM_FACE_STEP_USD} 的整数倍（如 1.5、3.2）` };
+    return { ok: false, value, reason: `金额必须是 ${CUSTOM_FACE_STEP_USD} 的整数倍（如 1.25、3.02）` };
   }
 
   return { ok: true, value };
 }
 
-/** 把用户输入收敛到合法金额：向下取到最近的步长整数倍，并夹在 [0.1, MAX] 内。 */
+/** 把用户输入收敛到合法金额：向下取到最近的步长整数倍，并夹在 [0.01, MAX] 内。 */
 export function snapToStep(input: DecimalInput): Decimal {
   let value: Decimal;
   try {
