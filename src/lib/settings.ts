@@ -19,6 +19,7 @@ export type SettingKey =
   | "markup_pct"
   | "cancel_lock_seconds"
   | "safety_buffer_usd"
+  | "auto_cancel_minutes"
   | "face_value_presets";
 
 export const SETTING_KEYS: readonly SettingKey[] = [
@@ -26,8 +27,25 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "markup_pct",
   "cancel_lock_seconds",
   "safety_buffer_usd",
+  "auto_cancel_minutes",
   "face_value_presets",
 ];
+
+/**
+ * SettingKey → SiteSettings 字段名。**唯一映射表**。
+ *
+ * 为什么要有：读合并、写白名单、序列化三处都需要"键列表"，以前各抄一份，
+ * 结果 auto_cancel_minutes 加进来时漏了两处 —— 后台显示改成功、库里却没写，
+ * 刷新又回到旧值。现在读/写都用 SETTING_KEYS + 这张表推导，新增键只改这三行。
+ */
+const KEY_TO_FIELD: Record<SettingKey, keyof SiteSettings> = {
+  rate_ldc_per_usd: "rateLdcPerUsd",
+  markup_pct: "markupPct",
+  cancel_lock_seconds: "cancelLockSeconds",
+  safety_buffer_usd: "safetyBufferUsd",
+  auto_cancel_minutes: "autoCancelMinutes",
+  face_value_presets: "faceValuePresets",
+};
 
 export interface SiteSettings {
   /** 1 美元 Grizzly 余额卖多少 LDC（不含 markup）。 */
@@ -38,6 +56,13 @@ export interface SiteSettings {
   cancelLockSeconds: number;
   /** 不可被动用的安全缓冲（美元），防账本推算与真实余额偏差导致超卖。 */
   safetyBufferUsd: Decimal;
+  /**
+   * 保底回收：取号后多少分钟仍未收到验证码，系统自动取消激活。
+   * 目的不是省钱而是止损 —— 号码挂着不但白占供应商库存，还可能被上游
+   * 计入"长期未使用"而拉低账号质量。取消后**不退还**卡密余额（见 SPEC）。
+   * 0 = 关闭自动回收。
+   */
+  autoCancelMinutes: number;
   /** 首页面值档位（美元）。 */
   faceValuePresets: number[];
 }
@@ -60,12 +85,14 @@ const HARD_DEFAULTS: {
   markupPct: number;
   cancelLockSeconds: number;
   safetyBufferUsd: number;
+  autoCancelMinutes: number;
   faceValuePresets: number[];
 } = {
   rateLdcPerUsd: 1.1,
   markupPct: 0,
   cancelLockSeconds: 90,
   safetyBufferUsd: 0.5,
+  autoCancelMinutes: 16,
   faceValuePresets: [1, 3, 5, 10],
 };
 
@@ -96,6 +123,7 @@ export function getEnvFallbackSettings(): SiteSettings {
   let markup = HARD_DEFAULTS.markupPct;
   let lock = HARD_DEFAULTS.cancelLockSeconds;
   let buffer = HARD_DEFAULTS.safetyBufferUsd;
+  let autoCancel = HARD_DEFAULTS.autoCancelMinutes;
   let presets = [...HARD_DEFAULTS.faceValuePresets];
 
   try {
@@ -104,6 +132,7 @@ export function getEnvFallbackSettings(): SiteSettings {
     markup = envNumber(HARD_DEFAULTS.markupPct, String(cfg.MARKUP_PCT));
     lock = envNumber(HARD_DEFAULTS.cancelLockSeconds, String(cfg.CANCEL_LOCK_SECONDS));
     buffer = envNumber(HARD_DEFAULTS.safetyBufferUsd, String(cfg.SAFETY_BUFFER_USD));
+    autoCancel = envNumber(HARD_DEFAULTS.autoCancelMinutes, process.env.AUTO_CANCEL_MINUTES);
     presets = parsePresets(process.env.FACE_VALUE_PRESETS);
   } catch {
     /* 配置不全时用硬编码默认，保证后台可用 */
@@ -114,6 +143,7 @@ export function getEnvFallbackSettings(): SiteSettings {
     markupPct: markup,
     cancelLockSeconds: lock,
     safetyBufferUsd: dec(buffer),
+    autoCancelMinutes: autoCancel,
     faceValuePresets: presets,
   };
 }
@@ -143,6 +173,12 @@ function parseDbValue(key: SettingKey, raw: string, base: SiteSettings): Partial
       const n = Number(raw);
       if (!Number.isFinite(n) || n < 0) return {};
       return { safetyBufferUsd: dec(n) };
+    }
+    case "auto_cancel_minutes": {
+      const n = Number(raw);
+      /* 0 = 关闭；上限 24h，防止误填一个巨大的值等于没生效 */
+      if (!Number.isFinite(n) || n < 0 || n > 1440) return {};
+      return { autoCancelMinutes: Math.floor(n) };
     }
     case "face_value_presets": {
       const parsed = parsePresets(raw);
@@ -198,7 +234,7 @@ export async function getSiteSettings(): Promise<SiteSettings> {
 
   const effective: SiteSettings = {
     ...envBase,
-    ...(["rate_ldc_per_usd", "markup_pct", "cancel_lock_seconds", "safety_buffer_usd", "face_value_presets"] as const).reduce(
+    ...SETTING_KEYS.reduce(
       (acc, key) => {
         const raw = fromDb[key];
         if (raw === undefined) return acc;
@@ -234,6 +270,8 @@ function serialize(key: SettingKey, next: SiteSettings): string {
       return String(Math.floor(next.cancelLockSeconds));
     case "safety_buffer_usd":
       return toStorageString(next.safetyBufferUsd);
+    case "auto_cancel_minutes":
+      return String(Math.floor(next.autoCancelMinutes));
     case "face_value_presets":
       return next.faceValuePresets.join(",");
     default:
@@ -253,34 +291,14 @@ export async function updateSiteSettings(patch: Partial<SiteSettings>): Promise<
       patch.cancelLockSeconds !== undefined ? Math.floor(patch.cancelLockSeconds) : current.cancelLockSeconds,
     safetyBufferUsd:
       patch.safetyBufferUsd !== undefined ? dec(patch.safetyBufferUsd) : current.safetyBufferUsd,
+    autoCancelMinutes:
+      patch.autoCancelMinutes !== undefined ? Math.floor(patch.autoCancelMinutes) : current.autoCancelMinutes,
     faceValuePresets: patch.faceValuePresets !== undefined ? [...patch.faceValuePresets] : current.faceValuePresets,
   };
 
   // 只写「显式传进来」的键，避免把环境变量兜底值固化进库
-  const touched = (
-    [
-      "rate_ldc_per_usd",
-      "markup_pct",
-      "cancel_lock_seconds",
-      "safety_buffer_usd",
-      "face_value_presets",
-    ] as const
-  ).filter((key) => {
-    switch (key) {
-      case "rate_ldc_per_usd":
-        return patch.rateLdcPerUsd !== undefined;
-      case "markup_pct":
-        return patch.markupPct !== undefined;
-      case "cancel_lock_seconds":
-        return patch.cancelLockSeconds !== undefined;
-      case "safety_buffer_usd":
-        return patch.safetyBufferUsd !== undefined;
-      case "face_value_presets":
-        return patch.faceValuePresets !== undefined;
-      default:
-        return false;
-    }
-  });
+  /* 只写「显式传进来」的键：由 SETTING_KEYS + 映射表推导，不再手抄列表 */
+  const touched = SETTING_KEYS.filter((key) => patch[KEY_TO_FIELD[key]] !== undefined);
 
   for (const key of touched) {
     const value = serialize(key, merged);

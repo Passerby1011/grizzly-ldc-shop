@@ -13,6 +13,7 @@ const BodySchema = z
     markupPct: z.coerce.number().min(0).max(10000).optional(),
     cancelLockSeconds: z.coerce.number().min(0).max(3600).optional(),
     safetyBufferUsd: z.union([z.number(), z.string()]).optional(),
+    autoCancelMinutes: z.coerce.number().min(0).max(1440).optional(),
     faceValuePresets: z.array(z.coerce.number().positive()).min(1).max(12).optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: "没有需要修改的字段" })
@@ -32,6 +33,7 @@ function serialize(view: Awaited<ReturnType<typeof getSiteSettingsView>>) {
       markupPct: view.effective.markupPct,
       cancelLockSeconds: view.effective.cancelLockSeconds,
       safetyBufferUsd: view.effective.safetyBufferUsd.toFixed(2),
+      autoCancelMinutes: view.effective.autoCancelMinutes,
       faceValuePresets: view.effective.faceValuePresets,
     },
     envFallback: {
@@ -39,6 +41,7 @@ function serialize(view: Awaited<ReturnType<typeof getSiteSettingsView>>) {
       markupPct: view.envFallback.markupPct,
       cancelLockSeconds: view.envFallback.cancelLockSeconds,
       safetyBufferUsd: view.envFallback.safetyBufferUsd.toFixed(2),
+      autoCancelMinutes: view.envFallback.autoCancelMinutes,
       faceValuePresets: view.envFallback.faceValuePresets,
     },
     fromDb: view.fromDb,
@@ -47,6 +50,8 @@ function serialize(view: Awaited<ReturnType<typeof getSiteSettingsView>>) {
       markupPct: "叠加在汇率之上的毛利百分比",
       cancelLockSeconds: "取号后可取消的最短等待秒数（上游实测约 60 秒内会被拒）",
       safetyBufferUsd: "不可被动用的安全缓冲（美元），防账本与真实余额偏差导致超卖",
+      autoCancelMinutes:
+        "取号后多少分钟仍未收到验证码就自动取消激活（止损用，取消后不退还卡密余额）；0 = 关闭",
       faceValuePresets: "首页面值档位（美元）",
     },
   };
@@ -68,6 +73,7 @@ export const PUT = withRoute(async (request: Request) => {
     markupPct: body.markupPct,
     cancelLockSeconds: body.cancelLockSeconds,
     safetyBufferUsd: body.safetyBufferUsd !== undefined ? dec(body.safetyBufferUsd) : undefined,
+    autoCancelMinutes: body.autoCancelMinutes,
     faceValuePresets: body.faceValuePresets,
   });
 

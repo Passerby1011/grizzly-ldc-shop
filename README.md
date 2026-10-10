@@ -121,6 +121,39 @@ git config core.hooksPath .githooks
    | `NEXT_PUBLIC_APP_URL` | 站点对外地址（决定 `notify_url` 与 Cookie 的 Secure 标记） |
    | `CRON_SECRET` | Cron 鉴权口令 |
 
+## 保底回收（超时自动取消激活）
+
+取号后一直没收到验证码的号码会**永远挂着**，既白占供应商库存，也拉低账号质量。
+所以有一个巡检任务：超过 `autoCancelMinutes`（默认 16 分钟，后台可改，0 = 关闭）
+仍是 `waiting` 的激活会被取消掉。
+
+**计费口径（重要）**：回收成功**不退还卡密余额** —— 号码已被上游消耗，买家承担
+未收到码的风险。回收只做两件事：调上游 `setStatus(8)` 释放占用 + 本地置 `expired`，
+**绝不写账本**（有源码级测试钉死这条）。
+
+> 实测：上游取消窗口在 64s～334s 之间浮动（按供应商变），16 分钟留了约 3 倍余量；
+> `ACCESS_CANCEL` 会把号码费用退回主账号，所以回收本身不亏钱。
+
+触发方式（两个都需要）：
+
+| 方式 | 端点 | 说明 |
+|---|---|---|
+| 外部定时器（**主力**） | `GET /api/cron/sweep` | 带 `Authorization: Bearer $CRON_SECRET`，建议每 5 分钟打一次 |
+| 轮询兜底 | 无（内联） | 接码台轮询时顺带扫一眼，同实例 60 秒限流 |
+
+> ⚠️ 为什么不能只靠 Vercel Cron：Hobby 套餐每个 cron **每天最多 1 次**，
+> 16 分钟的回收窗口靠天级任务根本来不及。`vercel.json` 里那条 `/api/cron/sweep`
+> 只是兜底，真正频率靠外部定时器。
+
+### 另一个已修的资金漏洞（竞态）
+
+轮询拿到验证码后一度是「无条件写回 ok 并下发验证码」。若用户在此期间点了取消
+（已退款、本地置 `cancelled`），就会**同时拿到退款和验证码** —— 卖家既付了上游
+成本又退了款。
+
+现在 `pollActivation` 先用条件 UPDATE 认领（只有仍是 `waiting` 才能变 `ok`），
+认领失败就绝不通知上游、绝不下发验证码。
+
 5. **Cron**：仓库根的 `vercel.json` 声明了 `GET /api/cron/reconcile`（**每天 03:00 一次**）。
    Vercel 会自动带 `Authorization: Bearer CRON_SECRET` 调用。
 

@@ -6,6 +6,7 @@
  * 并且数据库不可用时必须静默回退（不能把站点拖垮）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SettingKey } from "../settings";
 
 /** 每行 key/value；由测试直接操纵。 */
 const store = new Map<string, string>();
@@ -169,5 +170,54 @@ describe("updateSiteSettings", () => {
   it("非法值拒绝入库", async () => {
     await updateSiteSettings({ rateLdcPerUsd: "-3" as any });
     expect(store.has("rate_ldc_per_usd")).toBe(false);
+  });
+});
+
+describe("updateSiteSettings：每个可写键都必须真的落库", () => {
+  /*
+   * 回归：auto_cancel_minutes 加入时，updateSiteSettings 的 touched 白名单
+   * switch 里漏了这个 case，落到 default: return false → 永远不 upsert。
+   * 表现是「后台显示改成功了（merged 里是新值），但刷新后回到旧值」。
+   * 这类"写入路径漏一个分支"的 bug 单测不覆盖就只能在端到端里发现。
+   */
+  const cases: Array<[SettingKey, Record<string, unknown>]> = [
+    ["rate_ldc_per_usd", { rateLdcPerUsd: "2.50" }],
+    ["markup_pct", { markupPct: 12 }],
+    ["cancel_lock_seconds", { cancelLockSeconds: 45 }],
+    ["safety_buffer_usd", { safetyBufferUsd: "0.75" }],
+    ["auto_cancel_minutes", { autoCancelMinutes: 16 }],
+    ["face_value_presets", { faceValuePresets: [1, 2, 5] }],
+  ];
+
+  it.each(cases)("%s 写入后能从库里读回", async (key, patch) => {
+    store.clear();
+    resetSettingsCache();
+    upsert.mockClear();
+
+    await updateSiteSettings(patch as never);
+
+    expect(upsert, `${key} 应触发一次 upsert`).toHaveBeenCalledTimes(1);
+    expect(upsert.mock.calls[0][0].where.key).toBe(key);
+    expect(store.get(key), `${key} 应写进 store`).toBeTruthy();
+
+    /* 再读一次应拿到刚写的值（而不是回退到 env/默认） */
+    resetSettingsCache();
+    const view = await getSiteSettingsView();
+    expect(view.fromDb[key], `${key} 应出现在 fromDb`).toBeTruthy();
+  });
+
+  it("autoCancelMinutes = 0 是合法值（表示关闭），必须能存", async () => {
+    store.clear();
+    resetSettingsCache();
+    upsert.mockClear();
+
+    await updateSiteSettings({ autoCancelMinutes: 0 } as never);
+
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(store.get("auto_cancel_minutes")).toBe("0");
+
+    resetSettingsCache();
+    const settings = await getSiteSettings();
+    expect(settings.autoCancelMinutes).toBe(0);
   });
 });

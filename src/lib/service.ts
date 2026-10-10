@@ -290,7 +290,29 @@ export async function pollActivation(input: {
 
   switch (parsed.state) {
     case "OK": {
-      /* 完成：落库 + setStatus(6) 正式扣费（失败不回滚，钱已收） */
+      /*
+       * 关键：先「条件认领」再通知上游，顺序不能反。
+       *
+       * 这里曾经是「先 setStatus(6) 扣费、再无条件下发验证码」，存在竞态漏洞：
+       * 轮询读到 waiting → 查上游拿到码 → 期间用户点了取消（已退款、本地置 cancelled）
+       * → 本处无条件 update 又把状态写回 ok 并下发验证码。
+       * 结果：用户**同时**拿到退款和验证码，卖家既付了上游成本又退了款。
+       *
+       * 现在只有「仍是 waiting」时才能认领成功；认领失败说明已被取消/回收，
+       * 那就绝不通知上游、绝不下发验证码。
+       */
+      const claimed = await prisma.activation.updateMany({
+        where: { id: activation.id, status: "waiting" },
+        data: { status: "ok", code: parsed.code, closedAt: new Date() },
+      });
+      if (claimed.count === 0) {
+        const latest = await prisma.activation.findUnique({ where: { id: activation.id } });
+        return toPollResult(
+          latest ?? activation,
+          "该号码已取消/回收，不再下发验证码（费用按规则不退，请联系卖家）",
+        );
+      }
+      /* 认领成功后才通知上游完成（正式扣费）。失败不回滚：码已经给用户了。 */
       try {
         await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.ACTIVATION);
       } catch {
@@ -299,7 +321,7 @@ export async function pollActivation(input: {
       const smsText = await fetchSmsText(grizzly, activation.grizzlyId);
       const updated = await prisma.activation.update({
         where: { id: activation.id },
-        data: { status: "ok", code: parsed.code, smsText, closedAt: new Date() },
+        data: { smsText },
       });
       return toPollResult(updated, null);
     }
@@ -575,4 +597,133 @@ export async function queryAndSettleOrder(
     justIssued,
     warnings,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* 保底回收：超时未收到验证码就取消激活，释放上游占用                    */
+/* ------------------------------------------------------------------ */
+
+export interface SweepResult {
+  scanned: number;
+  /** 成功回收（上游已释放，本地置 expired，**不退还**卡密余额）。 */
+  recycled: number;
+  /** 期间收到验证码 → 按正常完成处理。 */
+  completed: number;
+  /** 上游仍拒绝取消（EARLY_CANCEL_DENIED 等），下次再试。 */
+  deferred: number;
+  errors: number;
+  autoCancelMinutes: number;
+}
+
+let lastSweepAt = 0;
+/** 机会式巡检的最小间隔：轮询很频繁，不能每次都扫库。 */
+const SWEEP_MIN_INTERVAL_MS = 60_000;
+
+/**
+ * 机会式巡检：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。
+ * 纯兜底，真正的频率保证靠 /api/cron/sweep 由外部定时器打。
+ */
+export async function maybeSweepStaleActivations(): Promise<SweepResult | null> {
+  const now = Date.now();
+  if (now - lastSweepAt < SWEEP_MIN_INTERVAL_MS) return null;
+  lastSweepAt = now;
+  try {
+    return await sweepStaleActivations();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 扫描「取号后超过 autoCancelMinutes 仍未收到验证码」的激活，取消掉以释放上游占用。
+ *
+ * 为什么要有：上游取消窗口实测在 64s～334s 之间浮动。号码一直挂着不但白占
+ * 供应商库存，还可能拉低账号质量；实测 ACCESS_CANCEL 会把号码费用退回主账号。
+ *
+ * 计费口径（老板定的规则）：**取消成功也不退还卡密余额** —— 号码已被消耗，
+ * 买家承担未收到码的风险。因此这里只改状态、只释放上游，**不写任何 ledger**。
+ *
+ * 幂等：本地用条件 UPDATE 抢占（waiting → expired），重复跑不会重复处理。
+ */
+export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {
+  const prisma = getPrisma();
+  const settings = await getSiteSettings();
+  const minutes = settings.autoCancelMinutes;
+  const empty: SweepResult = {
+    scanned: 0,
+    recycled: 0,
+    completed: 0,
+    deferred: 0,
+    errors: 0,
+    autoCancelMinutes: minutes,
+  };
+  if (!Number.isFinite(minutes) || minutes <= 0) return empty;
+
+  const cutoff = new Date(Date.now() - minutes * 60_000);
+  const stale = await prisma.activation.findMany({
+    where: { status: "waiting", createdAt: { lt: cutoff } },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+  if (!stale.length) return empty;
+
+  const grizzly = getGrizzlyClient();
+  const result: SweepResult = { ...empty, scanned: stale.length };
+
+  for (const activation of stale) {
+    let state: ParsedStatus;
+    try {
+      state = await grizzly.getStatus(activation.grizzlyId);
+    } catch {
+      result.errors += 1;
+      continue;
+    }
+
+    /* 期间收到码：按正常完成走，绝不当成"没收到"回收掉 */
+    if (state.state === "OK") {
+      const claimed = await prisma.activation.updateMany({
+        where: { id: activation.id, status: "waiting" },
+        data: { status: "ok", code: state.code, closedAt: new Date() },
+      });
+      if (claimed.count > 0) {
+        try {
+          await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.ACTIVATION);
+        } catch {
+          // 忽略
+        }
+        result.completed += 1;
+      }
+      continue;
+    }
+
+    /* 上游已取消（可能被上游自己超时清掉）→ 本地收口，同样不回补 */
+    if (state.state === "CANCEL") {
+      const claimed = await prisma.activation.updateMany({
+        where: { id: activation.id, status: "waiting" },
+        data: { status: "expired", closedAt: new Date() },
+      });
+      if (claimed.count > 0) result.recycled += 1;
+      continue;
+    }
+
+    /* 主动取消，释放上游占用 */
+    try {
+      await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.CANCEL);
+    } catch {
+      /* EARLY_CANCEL_DENIED / 网络错误 → 保持 waiting，下次巡检再试 */
+      result.deferred += 1;
+      continue;
+    }
+
+    const claimed = await prisma.activation.updateMany({
+      where: { id: activation.id, status: "waiting" },
+      data: { status: "expired", closedAt: new Date() },
+    });
+    if (claimed.count > 0) result.recycled += 1;
+  }
+
+  if (result.recycled || result.completed) {
+    console.log("[sweep] 保底回收", JSON.stringify(result));
+  }
+  return result;
 }

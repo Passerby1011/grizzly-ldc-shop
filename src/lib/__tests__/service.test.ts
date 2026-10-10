@@ -2,22 +2,35 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetConfigCache } from "../config";
 import { GRIZZLY_STATUS, GrizzlyApiError, type GrizzlyClient } from "../grizzly";
 import { ApiError } from "../http";
-import { cancelActivation, pollActivation } from "../service";
+import { readFileSync } from "node:fs";
+import { cancelActivation, pollActivation, sweepStaleActivations } from "../service";
 
 const mocks = vi.hoisted(() => {
   const activation = {
     findUnique: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
+    findMany: vi.fn(),
   };
   const prisma = {
     activation,
     $transaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback({ activation })),
   };
-  return { activation, prisma };
+  const grizzly = { setStatus: vi.fn(), getStatus: vi.fn() };
+  return { activation, prisma, grizzly };
 });
 
 vi.mock("../db", () => ({ getPrisma: () => mocks.prisma }));
+
+/* 保底回收用模块单例客户端 + 站点设置，这里替换掉 */
+vi.mock("../grizzly", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../grizzly")>();
+  return { ...actual, getGrizzlyClient: () => mocks.grizzly };
+});
+
+vi.mock("../settings", () => ({
+  getSiteSettings: vi.fn(async () => ({ autoCancelMinutes: 16 })),
+}));
 
 vi.mock("../ledger", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ledger")>();
@@ -171,5 +184,133 @@ describe("pollActivation：取消倒计时字段（服务端算，刷新不丢�
 
     expect(view.cancelAvailableInSeconds).toBe(0);
     expect(Date.parse(view.cancelLockedUntil)).toBeLessThan(Date.now());
+  });
+});
+
+describe("pollActivation：并发漏洞（收到码与取消同时发生）", () => {
+  /*
+   * 曾经的缺陷：轮询拿到 STATUS_OK 后无条件把状态写回 ok 并下发验证码。
+   * 若用户在此之间点了取消（已退款、本地置 cancelled），就会同时拿到
+   * 「退款 + 验证码」，卖家既付了上游成本又退了款。
+   * 修法：先用条件 UPDATE 认领（只有仍是 waiting 才能成 ok）。
+   */
+  it("认领成功 → 通知上游完成 + 下发验证码", async () => {
+    mocks.activation.findUnique.mockResolvedValue(activationRow());
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.activation.update.mockResolvedValue(activationRow({ status: "ok", code: "123456" }));
+    const grizzly = grizzlyStub();
+    grizzly.getStatus.mockResolvedValue({ state: "OK", code: "123456" });
+
+    const view = await pollActivation({
+      keyId: "key1",
+      activationId: "act1",
+      grizzly: grizzly.client,
+    });
+
+    expect(mocks.activation.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "act1", status: "waiting" } }),
+    );
+    expect(grizzly.setStatus).toHaveBeenCalledWith("g1", GRIZZLY_STATUS.ACTIVATION);
+    expect(view.status).toBe("ok");
+  });
+
+  it("认领失败（已被取消）→ 不通知上游、不下发验证码", async () => {
+    mocks.activation.findUnique
+      .mockResolvedValueOnce(activationRow())
+      .mockResolvedValue(activationRow({ status: "cancelled", code: null }));
+    mocks.activation.updateMany.mockResolvedValue({ count: 0 });
+    const grizzly = grizzlyStub();
+    grizzly.getStatus.mockResolvedValue({ state: "OK", code: "123456" });
+
+    const view = await pollActivation({
+      keyId: "key1",
+      activationId: "act1",
+      grizzly: grizzly.client,
+    });
+
+    /* 最关键的两条：绝不 setStatus(6)、绝不返回验证码 */
+    expect(grizzly.setStatus).not.toHaveBeenCalled();
+    expect(view.code).toBeNull();
+    expect(view.hint).toContain("不再下发验证码");
+  });
+});
+
+describe("sweepStaleActivations：保底回收", () => {
+  it("超时未收到码 → 取消上游 + 置 expired", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "WAIT_CODE" });
+    mocks.grizzly.setStatus.mockResolvedValue("CANCEL");
+
+    const r = await sweepStaleActivations();
+
+    expect(mocks.grizzly.setStatus).toHaveBeenCalledWith("g1", GRIZZLY_STATUS.CANCEL);
+    expect(mocks.activation.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "act1", status: "waiting" },
+        data: expect.objectContaining({ status: "expired" }),
+      }),
+    );
+    expect(r.recycled).toBe(1);
+  });
+
+  it("期间收到验证码 → 按正常完成，不回收", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "OK", code: "999" });
+
+    const r = await sweepStaleActivations();
+
+    expect(mocks.grizzly.setStatus).toHaveBeenCalledWith("g1", GRIZZLY_STATUS.ACTIVATION);
+    expect(r.completed).toBe(1);
+    expect(r.recycled).toBe(0);
+    /* 认领写的是 ok 而不是 expired */
+    expect(mocks.activation.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "ok" }) }),
+    );
+  });
+
+  it("上游已自行取消 → 本地收口为 expired（同样不退钱）", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "CANCEL" });
+
+    const r = await sweepStaleActivations();
+
+    expect(mocks.grizzly.setStatus).not.toHaveBeenCalled();
+    expect(r.recycled).toBe(1);
+  });
+
+  it("上游仍拒绝取消 → deferred，保持 waiting 下次再试", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "WAIT_CODE" });
+    mocks.grizzly.setStatus.mockRejectedValue(
+      new GrizzlyApiError("EARLY_CANCEL_DENIED", "EARLY_CANCEL_DENIED"),
+    );
+
+    const r = await sweepStaleActivations();
+
+    expect(r.deferred).toBe(1);
+    expect(r.recycled).toBe(0);
+    expect(mocks.activation.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("autoCancelMinutes = 0 → 关闭，不查库", async () => {
+    const settings = await import("../settings");
+    vi.mocked(settings.getSiteSettings).mockResolvedValueOnce({ autoCancelMinutes: 0 } as never);
+
+    const r = await sweepStaleActivations();
+
+    expect(r.scanned).toBe(0);
+    expect(mocks.activation.findMany).not.toHaveBeenCalled();
+  });
+
+  it("源码级：保底回收绝不写账本（不退卡密余额是硬规则）", () => {
+    const src = readFileSync("src/lib/service.ts", "utf8");
+    const body = src.slice(src.indexOf("export async function sweepStaleActivations"));
+    expect(body.length).toBeGreaterThan(200);
+    for (const banned of ["refund", "getLedger", "creditOrThrow", "debitOrThrow"]) {
+      expect(body, `sweep 里不允许出现 ${banned}`).not.toContain(banned);
+    }
   });
 });

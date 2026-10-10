@@ -57,6 +57,8 @@ export default function ShopPage() {
   const [orderError, setOrderError] = useState<string | null>(null);
 
   const [countries, setCountries] = useState<CountryView[]>([]);
+  /** 超时回收分钟数，仅用于文案展示（真值在服务端）。 */
+  const [autoCancelMinutes, setAutoCancelMinutes] = useState(16);
   const [countryFilter, setCountryFilter] = useState("");
   const [services, setServices] = useState<ServiceView[]>([]);
   const [country, setCountry] = useState("");
@@ -134,6 +136,14 @@ export default function ShopPage() {
   /* 国家 / 服务列表 */
   useEffect(() => {
     void (async () => {
+      try {
+        const cfg = await apiGet<{ autoCancelMinutes?: number }>("/api/site/config");
+        if (typeof cfg.autoCancelMinutes === "number" && cfg.autoCancelMinutes > 0) {
+          setAutoCancelMinutes(cfg.autoCancelMinutes);
+        }
+      } catch {
+        // 拿不到就用默认 16，纯展示用
+      }
       try {
         const data = await apiGet<{ countries: CountryView[] }>("/api/catalog/countries");
         setCountries(data.countries);
@@ -642,6 +652,26 @@ export default function ShopPage() {
             </div>
           ) : poll?.status === "cancelled" ? (
             <p className="muted">已取消，余额已回补。</p>
+          ) : poll?.status === "expired" ? (
+            /*
+             * 保底回收：等太久没等到验证码，系统自动把号码停掉了。
+             * 明确说明「不退还」——这是既定规则，不能含糊，否则用户会来讨。
+             */
+            <div
+              className="space-y-1.5 rounded-xl p-3"
+              style={{
+                border: "1px solid rgb(var(--warn) / 0.4)",
+                background: "rgb(var(--warn) / 0.08)",
+              }}
+            >
+              <p className="text-sm font-medium" style={{ color: "rgb(var(--warn))" }}>
+                该号码已超时回收
+              </p>
+              <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--fg-muted))" }}>
+                等待超过{autoCancelMinutes}分钟仍未收到验证码，系统已自动停用该号码。
+                号码已被上游消耗，<strong>本次费用不退还</strong>，请重新取号。
+              </p>
+            </div>
           ) : (
             <div className="space-y-3">
               <div className="flex items-center gap-2">
