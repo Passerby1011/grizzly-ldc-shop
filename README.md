@@ -157,6 +157,9 @@ git config core.hooksPath .githooks
 
 ## 安全
 
+- **依赖版本底线**：`next >= 15.5.27`。低于此版本受 **CVE-2025-66478（React2Shell，CVSS 10.0，RSC 远程代码执行）**
+  影响且官方无绕过方案，必须升级；本项目锁在已修复的 `15.5.27`。
+  升级后 Vercel 上的服务端环境变量建议**全部轮换一次**（官方建议，含 `GRIZZLY_API_KEY` / `LDC_KEY` / `ADMIN_TOKEN` / `CRON_SECRET` / 数据库口令）。
 - 卡密明文**不落库**，只存 SHA-256（`CardKey.codeHash`）。
 - 会话 Cookie 是 HMAC-SHA256 签名的 HttpOnly Cookie，密钥由 `LDC_KEY` 派生。
 - 管理接口用 `Authorization: Bearer ADMIN_TOKEN`，比较走常量时间。
