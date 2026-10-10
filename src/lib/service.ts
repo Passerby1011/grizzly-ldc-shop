@@ -24,7 +24,9 @@ import {
   type ParsedStatus,
 } from "./grizzly";
 import { getLdcClient, type LdcClient } from "./ldc";
-import { MAX_FACE_USD, MIN_FACE_USD, fulfillPaidOrder } from "./pool";
+import { MAX_FACE_USD, fulfillPaidOrder } from "./pool";
+import { checkFaceAmount } from "./face-value";
+import { getSiteSettings } from "./settings";
 import { badRequest, conflict, notFound, ERROR_CODES, forbidden } from "./http";
 
 /* ------------------------------------------------------------------ */
@@ -55,11 +57,18 @@ export async function createPayOrder(
   options: { ldc?: LdcClient } = {},
 ): Promise<CreatePayOrderResult> {
   const config = getConfig();
-  const faceUsd = dec(faceUsdInput);
-  if (faceUsd.lt(MIN_FACE_USD)) throw badRequest(`面值至少要 ${MIN_FACE_USD} USD`);
-  if (faceUsd.gt(MAX_FACE_USD)) throw badRequest(`面值不能超过 ${MAX_FACE_USD} USD`);
 
-  const amountLdc = usdToLdc(faceUsd, config.RATE_LDC_PER_USD, config.MARKUP_PCT);
+  /* 金额规则只认一处：0.1 步长 + 上下限。接口层也调同一个函数，避免两边判断不一致 */
+  const check = checkFaceAmount(faceUsdInput);
+  if (!check.ok) throw badRequest(check.reason ?? "金额不合法");
+  const faceUsd = check.value;
+
+  /*
+   * 汇率必须从「站点设置」读（DB > 环境变量 > 默认），不能直接用 config。
+   * 否则后台改了汇率，首页显示新价而下单按环境变量旧价收费 —— 价格错位。
+   */
+  const settings = await getSiteSettings();
+  const amountLdc = usdToLdc(faceUsd, settings.rateLdcPerUsd, settings.markupPct);
   const outTradeNo = generateOutTradeNo();
   const name = orderName(faceUsd);
   const prisma = getPrisma();

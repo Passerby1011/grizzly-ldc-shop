@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { jsonOk, readJsonBody, withRoute, conflict, ERROR_CODES } from "@/lib/http";
-import { dec } from "@/lib/money";
+import { jsonOk, readJsonBody, withRoute, conflict, badRequest, ERROR_CODES } from "@/lib/http";
+import { checkFaceAmount } from "@/lib/face-value";
 import { checkPoolCapacity } from "@/lib/pool";
 import { createPayOrder } from "@/lib/service";
 
@@ -13,14 +13,18 @@ const BodySchema = z.object({
 
 export const POST = withRoute(async (request: Request) => {
   const body = await readJsonBody(request, BodySchema);
-  const faceUsd = dec(body.faceUsd);
+
+  /* 金额规则与 service 层共用同一个函数，避免「接口放行、服务拒绝」的不一致 */
+  const check = checkFaceAmount(body.faceUsd);
+  if (!check.ok) throw badRequest(check.reason ?? "金额不合法");
+  const faceUsd = check.value;
 
   /* 卖之前先看一眼池子：只有实时读到 Grizzly 余额时才硬拦，降级读数不拦。 */
-  const check = await checkPoolCapacity(faceUsd);
-  if (!check.ok && check.pool.source === "grizzly") {
+  const pool = await checkPoolCapacity(faceUsd);
+  if (!pool.ok && pool.pool.source === "grizzly") {
     throw conflict(ERROR_CODES.POOL_EXHAUSTED, "可售余额不足，请稍后再试或联系卖家", {
-      requiredUsd: check.requiredUsd.toFixed(2),
-      availableUsd: check.availableUsd.toFixed(2),
+      requiredUsd: pool.requiredUsd.toFixed(2),
+      availableUsd: pool.availableUsd.toFixed(2),
     });
   }
 

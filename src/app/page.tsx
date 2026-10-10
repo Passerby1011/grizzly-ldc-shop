@@ -3,6 +3,7 @@ import { tryGetConfig } from "@/lib/config";
 import { effectiveLdcRate, usdToLdc } from "@/lib/money";
 import { getSiteSettings } from "@/lib/settings";
 import { BuyButton } from "./_components/BuyButton";
+import { CustomAmountBuy } from "./_components/CustomAmountBuy";
 
 export const dynamic = "force-dynamic";
 
@@ -105,6 +106,11 @@ export default async function HomePage() {
             </div>
           ))}
         </div>
+      </section>
+
+      {/* 自定义金额 */}
+      <section>
+        <CustomAmountBuy />
       </section>
 
       {/* 流程 */}
