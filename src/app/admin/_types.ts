@@ -109,6 +109,11 @@ export interface OrderRow {
   createdAt: string;
   keyPrefix: string | null;
   keyStatus: string | null;
+  /** purchase = 新购；topup = 充值 */
+  kind: string;
+  /** 充值订单的目标卡密（新购为 null） */
+  targetKeyPrefix: string | null;
+  targetKeyStatus: string | null;
 }
 
 export type OrderListView = Paged<never> & { orders: OrderRow[] };

@@ -197,3 +197,32 @@ describe("充值金额规则与买卡一致", () => {
     expect(fields).toEqual(["amountUsd"]);
   });
 });
+
+describe("充值必须同时累加面值", () => {
+  /*
+   * 回归：曾经只加 balanceUsd、不加 faceUsd。
+   * 实测 GS-XWT9：买卡 $0.15 + 充值 $0.12，面值却一直显示 $0.15，
+   * 后台看不出这张卡的真实体量（老板就是因此以为充值没到账）。
+   */
+  it("给目标卡密的 faceUsd 做原子 increment", async () => {
+    mocks.state.order = orderRow();
+    mocks.state.key = { id: "k1", codePrefix: "GS-AAAA", status: "active", balanceUsd: dec("1.00"), faceUsd: dec("1.00") };
+    mocks.tx.cardKey.update.mockClear();
+
+    await fulfillPaidOrder({ orderId: "o1", trace: "notify" });
+
+    /* mock 的 update 返回 {} 会让 TS 把 calls 推断成 never[]，这里显式断言 */
+    const calls = mocks.tx.cardKey.update.mock.calls as unknown as Array<
+      [{ where: { id: string }; data: { faceUsd?: unknown } }]
+    >;
+    const incCall = calls.find((c) => c[0]?.data?.faceUsd && typeof c[0].data.faceUsd === "object");
+    expect(incCall, "必须对 faceUsd 做 increment").toBeTruthy();
+    expect(incCall![0].where.id).toBe("k1");
+  });
+
+  it("面值用 increment 而非读改写（防并发丢更新）", () => {
+    const src = readFileSync("src/lib/pool.ts", "utf8");
+    const fn = src.slice(src.indexOf('if (order.kind === "topup")'), src.indexOf("/* ---- 新购"));
+    expect(fn).toContain("faceUsd: { increment: order.faceUsd }");
+  });
+});

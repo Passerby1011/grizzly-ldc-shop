@@ -31,7 +31,11 @@ export const GET = withRoute(async (request: Request) => {
       orderBy: { createdAt: "desc" },
       skip: (page - 1) * pageSize,
       take: pageSize,
-      include: { key: { select: { codePrefix: true, status: true } } },
+      include: {
+        /* 新购：卡密是新建的（key）；充值：卡密是被充值的（targetKey） */
+        key: { select: { codePrefix: true, status: true } },
+        targetKey: { select: { codePrefix: true, status: true } },
+      },
     }),
   ]);
 
@@ -47,8 +51,14 @@ export const GET = withRoute(async (request: Request) => {
       status: o.status,
       paidAt: o.paidAt ? o.paidAt.toISOString() : null,
       createdAt: o.createdAt.toISOString(),
+      /** purchase = 新购卡密；topup = 给已有卡密充值。 */
+      kind: o.kind,
+      /* 新购的卡密 */
       keyPrefix: o.key?.codePrefix ?? null,
       keyStatus: o.key?.status ?? null,
+      /* 充值的目标卡密（新购订单为 null） */
+      targetKeyPrefix: o.targetKey?.codePrefix ?? null,
+      targetKeyStatus: o.targetKey?.status ?? null,
     })),
     page,
     pageSize,

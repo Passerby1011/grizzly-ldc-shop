@@ -638,6 +638,7 @@ function RecordsTab() {
                 <thead>
                   <tr>
                     <th>订单号</th>
+                    <th>类型</th>
                     <th>名称</th>
                     <th>积分</th>
                     <th>面值</th>
@@ -650,13 +651,25 @@ function RecordsTab() {
                   {orders.orders.map((o) => (
                     <tr key={o.id}>
                       <td className="code-display text-xs">{o.outTradeNo.slice(0, 14)}…</td>
+                      <td>
+                        {/* 新购 vs 充值：不区分的话根本看不出这张卡是买的还是充的 */}
+                        <Badge tone={o.kind === "topup" ? "info" : "ok"}>
+                          {o.kind === "topup" ? "充值" : "买卡"}
+                        </Badge>
+                      </td>
                       <td>{o.name}</td>
                       <td className="tnum">{o.amountLdc}</td>
                       <td className="tnum">${o.faceUsd}</td>
                       <td>
                         <Badge tone={toneOf(o.status)}>{o.status}</Badge>
                       </td>
-                      <td className="code-display text-xs">{o.keyPrefix ?? "—"}</td>
+                      <td className="code-display text-xs">
+                        {o.kind === "topup"
+                          ? o.targetKeyPrefix
+                            ? `${o.targetKeyPrefix}（充入）`
+                            : "—"
+                          : (o.keyPrefix ?? "—")}
+                      </td>
                       <td className="faint">{shortTime(o.createdAt)}</td>
                     </tr>
                   ))}

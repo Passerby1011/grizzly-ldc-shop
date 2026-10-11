@@ -304,7 +304,17 @@ export async function fulfillPaidOrder(input: {
         };
       }
 
-      /* 加余额 —— getAllocatedUsd 是 sum(balanceUsd)，池占用会自动跟着涨 */
+      /*
+       * 加余额 + 同步累加面值（原子 increment，避免读-改-写竞态）。
+       *
+       * 面值 = 这张卡累计可花费的上限（买卡金额 + 历次充值）。
+       * 只加余额不加面值的话，后台会显示"面值 $0.15"却看不到已充入的 0.12。
+       * 注：getAllocatedUsd 是 sum(balanceUsd)，池占用只跟余额走，与面值无关。
+       */
+      await tx.cardKey.update({
+        where: { id: target.id },
+        data: { faceUsd: { increment: order.faceUsd } },
+      });
       await ledger.topUp(tx, target.id, order.faceUsd.toString(), orderId);
 
       /* 已作废/已耗尽的卡被充值后应回到可用状态 */
