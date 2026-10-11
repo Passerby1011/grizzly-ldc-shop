@@ -103,6 +103,20 @@ git config core.hooksPath .githooks
    - 建一个 Redis 数据库，拿 `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`。
    - 配了这两个变量后，`src/lib/idempotency.ts` 会自动把锁从「进程内」升级成
      「跨实例 Redis 锁」；不配则退化为内存锁（单实例部署够用）。
+> ⚠️ **改了 `prisma/schema.prisma` 就必须同步线上库**（否则线上接口会 500）。
+> Vercel 部署**不会**自动建表/加列，必须手动跑：
+>
+> ```bash
+> DATABASE_URL="<neon-url>" npx prisma db push
+> ```
+>
+> 血泪案例：给 Order 加 `kind`/`targetKeyId` 与新增 `ReconcileBaseline` 表时只对本地
+> 容器跑了 push，忘了线上 Neon，结果后台 `overview` 直接报
+> `The column Order.kind does not exist` —— 整个管理台挂掉。
+> 更坑的是降级容错会让对账「看起来正常」（返回推算值），掩盖真实缺失。
+>
+> 部署后自检：带口令打 `GET /api/admin/overview`，200 才算库结构对得上。
+
 3. **导入仓库到 Vercel**，框架选 Next.js，构建命令保持默认（`npm run build`）。
 4. **环境变量**（Production / Preview 都要配）：
 
