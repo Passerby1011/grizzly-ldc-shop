@@ -263,6 +263,13 @@ export interface PollActivationResult {
   cancelAvailableInSeconds: number;
   /** 可取消的时间点（ISO 时间戳）。 */
   cancelLockedUntil: string;
+  /**
+   * 距「超时自动回收」的剩余秒数；null = 未开启自动回收（autoCancelMinutes = 0）。
+   * 从**本号码自己的取号时间**算起，与巡检频率无关。
+   */
+  autoCancelInSeconds: number | null;
+  /** 自动回收时间点（ISO）；null = 未开启。 */
+  autoCancelAt: string | null;
 }
 
 export async function pollActivation(input: {
@@ -275,11 +282,33 @@ export async function pollActivation(input: {
   const activation = await prisma.activation.findUnique({ where: { id: input.activationId } });
   if (!activation || activation.keyId !== input.keyId) throw notFound("激活记录不存在");
 
+  /* 超时回收阈值：每次都现取（有 30s 缓存），后台改了立刻反映到倒计时 */
+  const autoCancelMinutes = (await getSiteSettings()).autoCancelMinutes;
+
+  /*
+   * 精确回收：买家在等码时会每 4 秒轮询一次，所以**每次轮询都按号龄判一次**。
+   * 号龄 = now - 本号码自己的 createdAt，与巡检频率无关 —— 这才是
+   * 「从激活那一刻往后推 N 分钟」的正确落点。
+   *
+   * 上游硬约束：号码「有效期起只有 20 分钟」，官方 FAQ 说购买后 20 分钟内才可退款。
+   * 所以绝不能出现「16 分钟 + 一个巡检间隔」的漂移，否则越过红线就退不回钱。
+   */
+  if (
+    activation.status === "waiting" &&
+    Number.isFinite(autoCancelMinutes) &&
+    autoCancelMinutes > 0 &&
+    Date.now() >= activation.createdAt.getTime() + autoCancelMinutes * 60_000
+  ) {
+    await recycleOneActivation(activation.id);
+    const after = await prisma.activation.findUnique({ where: { id: activation.id } });
+    if (after) return toPollResult(after, "等待超时，号码已自动回收", autoCancelMinutes);
+  }
+
   if (activation.status === "ok") {
-    return toPollResult(activation, null);
+    return toPollResult(activation, null, autoCancelMinutes);
   }
   if (activation.status === "cancelled" || activation.status === "expired") {
-    return toPollResult(activation, null);
+    return toPollResult(activation, null, autoCancelMinutes);
   }
 
   const parsed: ParsedStatus = await grizzly.getStatus(activation.grizzlyId);
@@ -310,7 +339,8 @@ export async function pollActivation(input: {
         return toPollResult(
           latest ?? activation,
           "该号码已取消/回收，不再下发验证码（费用按规则不退，请联系卖家）",
-        );
+          autoCancelMinutes,
+      );
       }
       /* 认领成功后才通知上游完成（正式扣费）。失败不回滚：码已经给用户了。 */
       try {
@@ -323,22 +353,22 @@ export async function pollActivation(input: {
         where: { id: activation.id },
         data: { smsText },
       });
-      return toPollResult(updated, null);
+      return toPollResult(updated, null, autoCancelMinutes);
     }
     case "CANCEL": {
       /* 上游取消 → 等价于取消回补 */
       const refund = await cancelActivationInternal(activation.id, "upstream");
       const latest = await prisma.activation.findUnique({ where: { id: activation.id } });
-      return { ...toPollResult(latest ?? activation, "上游已取消，余额已回补"), balanceUsd: refund.balanceUsd };
+      return { ...toPollResult(latest ?? activation, "上游已取消，余额已回补", autoCancelMinutes), balanceUsd: refund.balanceUsd };
     }
     case "WAIT_RETRY":
-      return toPollResult(activation, "等待重发验证码");
+      return toPollResult(activation, "等待重发验证码", autoCancelMinutes);
     case "WAIT_RESEND":
-      return toPollResult(activation, "已请求重发");
+      return toPollResult(activation, "已请求重发", autoCancelMinutes);
     case "WAIT_CODE":
-      return toPollResult(activation, null);
+      return toPollResult(activation, null, autoCancelMinutes);
     default:
-      return toPollResult(activation, "上游返回未知状态");
+      return toPollResult(activation, "上游返回未知状态", autoCancelMinutes);
   }
 }
 
@@ -361,9 +391,11 @@ async function fetchSmsText(grizzly: GrizzlyClient, grizzlyId: string): Promise<
 function toPollResult(
   activation: { id: string; status: string; code: string | null; smsText: string | null; phone: string; costUsd: unknown; reservedUsd: unknown; createdAt: Date },
   hint: string | null,
+  autoCancelMinutes = 0,
 ): PollActivationResult {
   const cost = activation.costUsd ?? activation.reservedUsd;
   const window = cancelWindow(activation.createdAt);
+  const auto = autoCancelWindow(activation.createdAt, autoCancelMinutes);
   return {
     activationId: activation.id,
     status: activation.status as PollActivationResult["status"],
@@ -375,6 +407,8 @@ function toPollResult(
     balanceUsd: null,
     cancelAvailableInSeconds: window.cancelAvailableInSeconds,
     cancelLockedUntil: window.cancelLockedUntil,
+    autoCancelInSeconds: auto.autoCancelInSeconds,
+    autoCancelAt: auto.autoCancelAt,
   };
 }
 
@@ -382,6 +416,26 @@ function toPollResult(
  * 取消锁：取号后 CANCEL_LOCK_SECONDS 内不可取消（实测约 60s 会被上游拒绝）。
  * 由 `Activation.createdAt + CANCEL_LOCK_SECONDS` 服务端计算，刷新页面也不会丢。
  */
+/**
+ * 超时回收窗口：从**本号码的取号时间**算起 autoCancelMinutes 分钟。
+ *
+ * 注意与「巡检频率」是两回事：巡检只是"多久去看一眼"，判定永远按号龄算。
+ * 号龄到点后，最多再等一个巡检间隔就会被回收。
+ */
+function autoCancelWindow(
+  createdAt: Date,
+  minutes: number,
+): { autoCancelInSeconds: number | null; autoCancelAt: string | null } {
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return { autoCancelInSeconds: null, autoCancelAt: null };
+  }
+  const at = createdAt.getTime() + minutes * 60_000;
+  return {
+    autoCancelInSeconds: Math.max(0, Math.ceil((at - Date.now()) / 1000)),
+    autoCancelAt: new Date(at).toISOString(),
+  };
+}
+
 function cancelWindow(createdAt: Date): { cancelAvailableInSeconds: number; cancelLockedUntil: string } {
   const lockUntilMs = createdAt.getTime() + getConfig().CANCEL_LOCK_SECONDS * 1000;
   return {
@@ -616,8 +670,14 @@ export interface SweepResult {
 }
 
 let lastSweepAt = 0;
-/** 机会式巡检的最小间隔：轮询很频繁，不能每次都扫库。 */
-const SWEEP_MIN_INTERVAL_MS = 60_000;
+/**
+ * 机会式巡检的最小间隔。
+ *
+ * 主路径是 pollActivation 里的按号龄判定（见上），这里只负责捞**被遗弃**的激活
+ * ——买家关掉页面后没人轮询，就得靠这个 + /api/cron/sweep。
+ * 20 秒限制只是避免同一实例每次请求都扫库。
+ */
+const SWEEP_MIN_INTERVAL_MS = 20_000;
 
 /**
  * 机会式巡检：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。
@@ -645,6 +705,65 @@ export async function maybeSweepStaleActivations(): Promise<SweepResult | null> 
  *
  * 幂等：本地用条件 UPDATE 抢占（waiting → expired），重复跑不会重复处理。
  */
+/**
+ * 回收单个激活。定时器已废弃（serverless 内存定时器不可靠），
+ * 现在由 pollActivation 的按号龄判定与 sweepStaleActivations 共用这一条逻辑，
+ * 保证两条路径行为完全一致。
+ *
+ * 幂等：抢不到 waiting 就什么都不做。返回 deferred 表示上游此刻仍拒绝取消
+ * （EARLY_CANCEL_DENIED 等），保持 waiting 等下次再试 —— 这是正确行为，不是失败。
+ */
+async function recycleOneActivation(activationId: string): Promise<"recycled" | "completed" | "deferred" | "skipped"> {
+  const prisma = getPrisma();
+  const activation = await prisma.activation.findUnique({ where: { id: activationId } });
+  if (!activation || activation.status !== "waiting") return "skipped";
+
+  const grizzly = getGrizzlyClient();
+  let state: ParsedStatus;
+  try {
+    state = await grizzly.getStatus(activation.grizzlyId);
+  } catch {
+    return "deferred";
+  }
+
+  /* 期间收到码 → 按正常完成，绝不当成"没收到"回收掉 */
+  if (state.state === "OK") {
+    const claimed = await prisma.activation.updateMany({
+      where: { id: activationId, status: "waiting" },
+      data: { status: "ok", code: state.code, closedAt: new Date() },
+    });
+    if (claimed.count === 0) return "skipped";
+    try {
+      await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.ACTIVATION);
+    } catch {
+      // 忽略
+    }
+    return "completed";
+  }
+
+  /* 上游已取消 → 本地收口，同样不回补 */
+  if (state.state === "CANCEL") {
+    const claimed = await prisma.activation.updateMany({
+      where: { id: activationId, status: "waiting" },
+      data: { status: "expired", closedAt: new Date() },
+    });
+    return claimed.count > 0 ? "recycled" : "skipped";
+  }
+
+  /* 主动取消，释放上游占用（上游退款给卖家，但不回补卡密余额） */
+  try {
+    await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.CANCEL);
+  } catch {
+    return "deferred";
+  }
+
+  const claimed = await prisma.activation.updateMany({
+    where: { id: activationId, status: "waiting" },
+    data: { status: "expired", closedAt: new Date() },
+  });
+  return claimed.count > 0 ? "recycled" : "skipped";
+}
+
 export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {
   const prisma = getPrisma();
   const settings = await getSiteSettings();
@@ -667,63 +786,25 @@ export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {
   });
   if (!stale.length) return empty;
 
-  const grizzly = getGrizzlyClient();
   const result: SweepResult = { ...empty, scanned: stale.length };
 
+  /* 复用与闹钟相同的单条回收逻辑，保证两条路径行为完全一致 */
   for (const activation of stale) {
-    let state: ParsedStatus;
+    let outcome: Awaited<ReturnType<typeof recycleOneActivation>>;
     try {
-      state = await grizzly.getStatus(activation.grizzlyId);
+      outcome = await recycleOneActivation(activation.id);
     } catch {
       result.errors += 1;
       continue;
     }
-
-    /* 期间收到码：按正常完成走，绝不当成"没收到"回收掉 */
-    if (state.state === "OK") {
-      const claimed = await prisma.activation.updateMany({
-        where: { id: activation.id, status: "waiting" },
-        data: { status: "ok", code: state.code, closedAt: new Date() },
-      });
-      if (claimed.count > 0) {
-        try {
-          await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.ACTIVATION);
-        } catch {
-          // 忽略
-        }
-        result.completed += 1;
-      }
-      continue;
-    }
-
-    /* 上游已取消（可能被上游自己超时清掉）→ 本地收口，同样不回补 */
-    if (state.state === "CANCEL") {
-      const claimed = await prisma.activation.updateMany({
-        where: { id: activation.id, status: "waiting" },
-        data: { status: "expired", closedAt: new Date() },
-      });
-      if (claimed.count > 0) result.recycled += 1;
-      continue;
-    }
-
-    /* 主动取消，释放上游占用 */
-    try {
-      await grizzly.setStatus(activation.grizzlyId, GRIZZLY_STATUS.CANCEL);
-    } catch {
-      /* EARLY_CANCEL_DENIED / 网络错误 → 保持 waiting，下次巡检再试 */
-      result.deferred += 1;
-      continue;
-    }
-
-    const claimed = await prisma.activation.updateMany({
-      where: { id: activation.id, status: "waiting" },
-      data: { status: "expired", closedAt: new Date() },
-    });
-    if (claimed.count > 0) result.recycled += 1;
+    if (outcome === "recycled") result.recycled += 1;
+    else if (outcome === "completed") result.completed += 1;
+    else if (outcome === "deferred") result.deferred += 1;
   }
-
   if (result.recycled || result.completed) {
     console.log("[sweep] 保底回收", JSON.stringify(result));
   }
   return result;
 }
+
+

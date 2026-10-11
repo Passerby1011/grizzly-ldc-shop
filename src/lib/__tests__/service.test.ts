@@ -3,6 +3,7 @@ import { resetConfigCache } from "../config";
 import { GRIZZLY_STATUS, GrizzlyApiError, type GrizzlyClient } from "../grizzly";
 import { ApiError } from "../http";
 import { readFileSync } from "node:fs";
+import { getEnvFallbackSettings } from "../settings";
 import { cancelActivation, pollActivation, sweepStaleActivations } from "../service";
 
 const mocks = vi.hoisted(() => {
@@ -28,9 +29,13 @@ vi.mock("../grizzly", async (importOriginal) => {
   return { ...actual, getGrizzlyClient: () => mocks.grizzly };
 });
 
-vi.mock("../settings", () => ({
-  getSiteSettings: vi.fn(async () => ({ autoCancelMinutes: 16 })),
-}));
+vi.mock("../settings", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../settings")>();
+  return {
+    ...actual,
+    getSiteSettings: vi.fn(async () => ({ autoCancelMinutes: 16 })),
+  };
+});
 
 vi.mock("../ledger", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ledger")>();
@@ -236,6 +241,16 @@ describe("pollActivation：并发漏洞（收到码与取消同时发生）", ()
 });
 
 describe("sweepStaleActivations：保底回收", () => {
+  /*
+   * sweep 现在复用 recycleOneActivation（与精确闹钟同一条逻辑），
+   * 该函数会先 findUnique 取这条激活再判断，所以 mock 必须让它能取到。
+   */
+  beforeEach(() => {
+    mocks.activation.findUnique.mockResolvedValue(
+      activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) }),
+    );
+  });
+
   it("超时未收到码 → 取消上游 + 置 expired", async () => {
     mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
     mocks.activation.updateMany.mockResolvedValue({ count: 1 });
@@ -312,5 +327,58 @@ describe("sweepStaleActivations：保底回收", () => {
     for (const banned of ["refund", "getLedger", "creditOrThrow", "debitOrThrow"]) {
       expect(body, `sweep 里不允许出现 ${banned}`).not.toContain(banned);
     }
+  });
+});
+
+describe("超时回收：按号龄判定，不依赖定时器与巡检频率", () => {
+  /*
+   * 曾试图用进程内存 setTimeout 排精确闹钟 —— 在 serverless（Vercel）里不成立：
+   * 请求上下文结束后事件循环不再保证定时器存活，unref() 更是主动放弃。
+   * 实测取号 100 秒后仍是 waiting，证明闹钟根本没跑。
+   *
+   * 正确做法：判定永远按「号龄 = now - 该号码自己的 createdAt」，
+   * 由两个高频入口触发：
+   *   1) pollActivation —— 买家等码时每 4 秒轮询，当场就能判
+   *   2) /api/cron/sweep —— 外部定时器捞被遗弃（关掉页面）的激活
+   */
+  it("pollActivation 内按号龄判定并回收（源码级）", () => {
+    const src = readFileSync("src/lib/service.ts", "utf8");
+    const poll = src.slice(src.indexOf("export async function pollActivation"), src.indexOf("async function fetchSmsText"));
+    expect(poll).toContain("activation.createdAt.getTime() + autoCancelMinutes * 60_000");
+    expect(poll).toContain("await recycleOneActivation(activation.id)");
+  });
+
+  it("不再依赖进程内定时器（serverless 下不可靠）", () => {
+    const src = readFileSync("src/lib/service.ts", "utf8");
+    expect(src).not.toContain("scheduleAutoCancel");
+    expect(src).not.toContain("autoCancelTimers");
+  });
+
+  it("sweep 与轮询共用同一回收逻辑，避免两条路径行为漂移", () => {
+    const src = readFileSync("src/lib/service.ts", "utf8");
+    const sweep = src.slice(src.indexOf("export async function sweepStaleActivations"));
+    expect(sweep).toContain("await recycleOneActivation(activation.id)");
+  });
+
+  it("默认关闭（0），启用时的值必须显著小于上游 20 分钟红线", () => {
+    const view = getEnvFallbackSettings();
+    /* 老板 2026-10-11 决定先不启用，默认 0 = 关闭 */
+    expect(view.autoCancelMinutes).toBe(0);
+    /* 若将来启用，18 以内才安全（上游 20 分钟硬截止） */
+    expect(view.autoCancelMinutes).toBeLessThanOrEqual(18);
+  });
+
+  it("autoCancelInSeconds 从本号码取号时刻算起", async () => {
+    mocks.activation.findUnique.mockResolvedValue(activationRow());
+    mocks.activation.update.mockResolvedValue(activationRow());
+    const grizzly = grizzlyStub();
+    grizzly.getStatus.mockResolvedValue({ state: "WAIT_CODE" });
+
+    const view = await pollActivation({ keyId: "key1", activationId: "act1", grizzly: grizzly.client });
+
+    /* 刚取号 → 剩余应接近 autoCancelMinutes 整分钟 */
+    expect(view.autoCancelInSeconds).not.toBeNull();
+    expect(view.autoCancelInSeconds).toBeGreaterThan(0);
+    expect(view.autoCancelAt).toBeTruthy();
   });
 });

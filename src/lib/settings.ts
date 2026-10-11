@@ -58,9 +58,13 @@ export interface SiteSettings {
   safetyBufferUsd: Decimal;
   /**
    * 保底回收：取号后多少分钟仍未收到验证码，系统自动取消激活。
-   * 目的不是省钱而是止损 —— 号码挂着不但白占供应商库存，还可能被上游
-   * 计入"长期未使用"而拉低账号质量。取消后**不退还**卡密余额（见 SPEC）。
-   * 0 = 关闭自动回收。
+   *
+   * **默认 0 = 关闭**（老板 2026-10-11 决定先不启用）。
+   * 需要时在后台把值调成 16 左右即可，无需改代码/重新部署。
+   *
+   * 上游硬约束：号码「有效期起只有 20 分钟」，官方 FAQ 说购买后 20 分钟内
+   * 才可退款。所以一旦启用，取值必须显著小于 20（留重试余量）。
+   * 取消后**不退还**卡密余额 —— 这是老板定的规则，不是 bug。
    */
   autoCancelMinutes: number;
   /** 首页面值档位（美元）。 */
@@ -92,7 +96,7 @@ const HARD_DEFAULTS: {
   markupPct: 0,
   cancelLockSeconds: 90,
   safetyBufferUsd: 0.5,
-  autoCancelMinutes: 16,
+  autoCancelMinutes: 0,
   faceValuePresets: [1, 3, 5, 10],
 };
 

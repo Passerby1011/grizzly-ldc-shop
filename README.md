@@ -142,6 +142,11 @@ git config core.hooksPath .githooks
 
 ## 保底回收（超时自动取消激活）
 
+> ⚠️ **当前默认关闭**（`autoCancelMinutes = 0`，老板 2026-10-11 决定先不启用）。
+> 功能已实现并端到端验证通过，需要时在后台把值改成 16 左右即可生效，无需改代码。
+> 若要彻底删除，删掉 `sweepStaleActivations` / `maybeSweepStaleActivations` /
+> `/api/cron/sweep` 与相关设置即可。
+
 取号后一直没收到验证码的号码会**永远挂着**，既白占供应商库存，也拉低账号质量。
 所以有一个巡检任务：超过 `autoCancelMinutes`（默认 16 分钟，后台可改，0 = 关闭）
 仍是 `waiting` 的激活会被取消掉。
