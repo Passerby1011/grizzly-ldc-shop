@@ -12,7 +12,7 @@ export interface PoolView {
 
 export interface OverviewView {
   pool: PoolView;
-  ledger: { consumedUsd: string };
+  ledger: { consumedUsd: string; netConsumedUsd: string; manualAdjustedUsd: string };
   cards: { byStatus: Record<string, number>; total: number };
   orders: {
     byStatus: Record<string, number>;
@@ -164,6 +164,9 @@ export interface ReconcileView {
   realUsd: string;
   ledgerUsd: string;
   driftUsd: string;
+  baselineUsd: string;
+  netConsumedUsd: string;
+  manualAdjustedUsd: string;
   allocatedUsd: string;
   availableUsd: string;
   source: string;

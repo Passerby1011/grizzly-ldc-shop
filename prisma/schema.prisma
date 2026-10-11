@@ -167,3 +167,23 @@ model Setting {
   value     String
   updatedAt DateTime @updatedAt
 }
+
+/// 对账基准：上游账号的「初始投入」推断值（单行表，id 固定 "singleton"）。
+///
+/// 为什么需要它：上游余额只有两种真实变动 —— 我们自己取号消耗、上游退款。
+/// 其余变动（老板手动给 Grizzly 充值、或直接在上游买东西）系统无从得知。
+/// 所以用「基准投入 − 净消耗」推算应有余额，差额即「未解释变动」，
+/// 老板确认后点校准把它并进基准。
+///
+/// 关键：作废/恢复卡密是**纯本地动作**，不进净消耗，因此不会造成差额 ——
+/// 这正是旧公式（真实 − 已售未消耗 − 历史消耗）的病灶。
+model ReconcileBaseline {
+  id               String   @id @default("singleton")
+  /// 推断的上游初始投入（美元）= 首次观测余额 + 当时的净消耗
+  baselineUsd      Decimal  @db.Decimal(14, 4)
+  /// 设定基准时的净消耗（审计用）
+  consumedAtSetUsd Decimal  @db.Decimal(14, 4)
+  note             String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}

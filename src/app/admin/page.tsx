@@ -770,9 +770,27 @@ function OverviewTab({ refreshKey }: { refreshKey: number }) {
       const result = await adminPost<ReconcileView>("/api/admin/reconcile", {});
       setNotice(
         result.ok
-          ? `对账通过：真实余额 ${result.realUsd}，账本推算 ${result.ledgerUsd}，偏差 ${result.driftUsd}`
-          : `对账发现偏差 ${result.driftUsd}：${result.message ?? "请检查"}`,
+          ? `核对一致：上游 ${result.realUsd}，本地推算 ${result.ledgerUsd}，差额 ${result.driftUsd}`
+          : `合计差 ${result.driftUsd} USD：${result.message ?? "请检查"}`,
       );
+      await load();
+    } catch (caught) {
+      setError(adminError(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function calibrate() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await adminPut<{ baselineUsd: string; driftBefore: string; notice: string }>(
+        "/api/admin/reconcile",
+        {},
+      );
+      setNotice(`已把差额 ${result.driftBefore} USD 并入基准（新基准 ${result.baselineUsd}）`);
       await load();
     } catch (caught) {
       setError(adminError(caught));
@@ -786,7 +804,7 @@ function OverviewTab({ refreshKey }: { refreshKey: number }) {
   return (
     <div className="space-y-4">
       {error ? <Alert>{error}</Alert> : null}
-      {notice ? <Alert tone={notice.startsWith("对账通过") ? "ok" : "warn"}>{notice}</Alert> : null}
+      {notice ? <Alert tone={notice.startsWith("核对一致") || notice.startsWith("已把差额") ? "ok" : "warn"}>{notice}</Alert> : null}
 
       {data ? (
         <>
@@ -805,18 +823,30 @@ function OverviewTab({ refreshKey }: { refreshKey: number }) {
           <div className="card space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="text-sm font-semibold">池核算</h2>
+                <h2 className="text-sm font-semibold">余额核对</h2>
                 <p className="faint mt-1">
-                  可用 = 真实余额 − 已售未消耗 − 安全缓冲。数据源：{data.pool.source}
+                  本地应有余额 = 基准投入 − 净消耗 − 手工调整；差额 = 上游真实 − 本地应有。
+                  数据源：{data.pool.source}
                   {data.pool.degraded ? "（已降级，用的是快照）" : ""}
                 </p>
               </div>
-              <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void reconcile()}>
-                {busy ? "对账中…" : "立即对账"}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  disabled={busy}
+                  onClick={() => void calibrate()}
+                  title="把当前差额并入基准，使对账归零。只改基准，不动任何卡密余额与流水。"
+                >
+                  {busy ? "处理中…" : "校准差额"}
+                </button>
+                <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void reconcile()}>
+                  {busy ? "核对中…" : "立即核对"}
+                </button>
+              </div>
             </div>
             <p className="faint tnum">
-              历史消耗 ${data.ledger.consumedUsd} · 卡密 {data.cards.total} 张 · 订单 {data.orders.total} 单（已付{" "}
+              净消耗 ${data.ledger.netConsumedUsd} · 手工 ${data.ledger.manualAdjustedUsd} · 卡密 {data.cards.total} 张 · 订单 {data.orders.total} 单（已付{" "}
               {data.orders.paidAmountLdc} LDC / ${data.orders.paidFaceUsd}）· 激活 {data.activations.total} 次
             </p>
             {data.lastReconcile ? (

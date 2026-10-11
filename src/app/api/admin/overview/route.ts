@@ -2,7 +2,7 @@ import { jsonOk, withRoute } from "@/lib/http";
 import { requireAdmin } from "@/lib/admin";
 import { getPrisma } from "@/lib/db";
 import { dec, formatUsd } from "@/lib/money";
-import { getConsumedUsd, getPoolState } from "@/lib/pool";
+import { getConsumedUsd, getNetConsumedUsd, getManualAdjustedUsd, getPoolState } from "@/lib/pool";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,10 +12,12 @@ export const GET = withRoute(async (request: Request) => {
   requireAdmin(request);
   const prisma = getPrisma();
 
-  const [pool, consumed, keyGroups, orderGroups, activationGroups, paidOrders, recentOrders, recentActivations, lastRun, lastSnapshot] =
+  const [pool, consumed, netConsumed, manualAdjusted, keyGroups, orderGroups, activationGroups, paidOrders, recentOrders, recentActivations, lastRun, lastSnapshot] =
     await Promise.all([
       getPoolState(),
       getConsumedUsd(prisma),
+      getNetConsumedUsd(prisma),
+      getManualAdjustedUsd(prisma),
       prisma.cardKey.groupBy({ by: ["status"], _count: { _all: true } }),
       prisma.order.groupBy({ by: ["status"], _count: { _all: true } }),
       prisma.activation.groupBy({ by: ["status"], _count: { _all: true } }),
@@ -44,7 +46,12 @@ export const GET = withRoute(async (request: Request) => {
       observedAt: pool.observedAt ? pool.observedAt.toISOString() : null,
     },
     ledger: {
+      /** 所有负向流水之和：用户累计花掉多少（含手工扣款）。 */
       consumedUsd: formatUsd(consumed),
+      /** 净消耗：真正打到上游且没退回的部分 —— 对账等式用的就是它。 */
+      netConsumedUsd: formatUsd(netConsumed),
+      /** 手工调整净额（正=给用户加钱）。 */
+      manualAdjustedUsd: formatUsd(manualAdjusted),
     },
     cards: {
       byStatus: keyCounts,

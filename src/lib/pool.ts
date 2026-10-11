@@ -400,9 +400,18 @@ export async function computeLedgerUsd(prisma: PrismaClient = getPrisma()): Prom
 
 export interface ReconcileResult {
   ok: boolean;
+  /** 上游真实余额。 */
   realUsd: string;
+  /** 本地推算的应有余额（= 基准 − 净消耗 − 手工调整）。字段名沿用 ledgerUsd 兼容旧调用。 */
   ledgerUsd: string;
+  /** 差额 = 真实 − 应有。 */
   driftUsd: string;
+  /** 对账基准（推断的上游初始投入）。 */
+  baselineUsd: string;
+  /** 净消耗：只含真正打到上游的部分。 */
+  netConsumedUsd: string;
+  /** 手工调整净额（不计入对账等式，单列展示）。 */
+  manualAdjustedUsd: string;
   allocatedUsd: string;
   availableUsd: string;
   source: RealBalanceSource;
@@ -413,17 +422,115 @@ export interface ReconcileResult {
  * 对账：真实余额 vs 账本推算，写快照 + 运行记录。
  * 有漂移（> 1 分钱）时 `ok=false` 并在 message 里说明，供 cron 告警。
  */
+/**
+ * 净消耗：**所有真正打到上游的余额变动**（只有这类才该进对账等式）。
+ *
+ * 与旧的 computeLedgerUsd 的关键区别：旧口径把「已售未消耗」当资产加进来，
+ * 而作废/恢复卡密只改本地状态、不碰上游，却会改变「已售未消耗」——
+ * 于是老板手动作废一张卡，对账就凭空差出一个卡片余额（实测差 1.74）。
+ * 那是错误的等式，不是真的漂移。
+ *
+ * 进等式的只有：
+ *   取号预扣(reserve/get_number)  −  退回(adjust_reserve/cancel_refund)
+ * 出等式的（纯本地动作，不碰上游）：
+ *   发卡/充值入账(reserve/topup)   —— 钱在卡里没花出去
+ *   作废/恢复(改 status)           —— 连流水都不产生
+ *   手工调整(manual)               —— 有正有负，方向不明，单独列出不计入
+ */
+export async function getNetConsumedUsd(client = getPrisma()): Promise<Decimal> {
+  const aggregate = await client.keyLedger.aggregate({
+    _sum: { deltaUsd: true },
+    where: {
+      reason: { in: ["get_number", "adjust_reserve", "cancel_refund"] },
+    },
+  });
+  const value = aggregate._sum.deltaUsd;
+  /* 取号是负向、退回是正向，求和后取负 = 净消耗 */
+  return value ? dec(value.toString()).negated() : dec(0);
+}
+
+/** 手工调整的净额（正=给用户加钱，负=从用户扣钱）。不计入对账，但要在界面单列。 */
+export async function getManualAdjustedUsd(client = getPrisma()): Promise<Decimal> {
+  const aggregate = await client.keyLedger.aggregate({
+    _sum: { deltaUsd: true },
+    where: { reason: "manual" },
+  });
+  const value = aggregate._sum.deltaUsd;
+  return value ? dec(value.toString()) : dec(0);
+}
+
+/** 读取对账基准；没有就按「当前余额 + 当前净消耗」推断一个并落库。 */
+export async function ensureReconcileBaseline(
+  realBalanceUsd: DecimalInput,
+): Promise<{ baselineUsd: Decimal; created: boolean; tableMissing?: boolean }> {
+  const prisma = getPrisma();
+  let existing: { baselineUsd: { toString(): string } } | null = null;
+  try {
+    existing = await prisma.reconcileBaseline.findUnique({ where: { id: "singleton" } });
+  } catch {
+    /*
+     * 表还没建（线上忘记跑 prisma db push）→ 降级为「按当前余额推算」，
+     * 绝不让对账功能整个挂掉。此时差额必然为 0，界面会提示需要迁移。
+     */
+    const consumedFallback = await getNetConsumedUsd(prisma).catch(() => dec(0));
+    return { baselineUsd: dec(realBalanceUsd).plus(consumedFallback), created: false, tableMissing: true };
+  }
+  if (existing) {
+    return { baselineUsd: dec(existing.baselineUsd.toString()), created: false };
+  }
+  /*
+   * 首次推断：假设此刻余额全部来自初始投入减去已发生的消耗，
+   * 即 baseline = 当前余额 + 净消耗。这是**无漂移假设**下的自洽解，
+   * 用于给老板一个起点，之后差额会诚实地显现出来。
+   */
+  const consumed = await getNetConsumedUsd(prisma);
+  const baseline = dec(realBalanceUsd).plus(consumed);
+  try {
+    await prisma.reconcileBaseline.create({
+      data: {
+        id: "singleton",
+        baselineUsd: toStorageString(baseline),
+        consumedAtSetUsd: toStorageString(consumed),
+        note: "首次自动推断",
+      },
+    });
+    return { baselineUsd: baseline, created: true };
+  } catch {
+    /* 同上：表不存在时只推算不落库 */
+    return { baselineUsd: baseline, created: false, tableMissing: true };
+  }
+}
+
+/**
+ * 对账：本地推算余额 vs 上游真实余额。
+ *
+ *   应有余额 = 基准投入 − 净消耗
+ *   差额     = 真实余额 − 应有余额
+ *
+ * 差额只可能来自**我们不知道的上游变动**：老板手动给 Grizzly 充值、
+ * 或直接在上游买了东西。作废/发卡/充值入账都不会造成差额。
+ * 核对无误后点「校准」把差额并入基准即可归零。
+ */
 export async function runReconcile(
   options: { client?: GrizzlyClient; safetyBufferUsd?: DecimalInput } = {},
 ): Promise<ReconcileResult> {
   const prisma = getPrisma();
   const pool = await getPoolState(options);
-  const ledgerUsd = await computeLedgerUsd(prisma);
-  const drift = pool.realBalanceUsd.minus(ledgerUsd);
+
+  const netConsumed = await getNetConsumedUsd(prisma);
+  const manualAdjusted = await getManualAdjustedUsd(prisma);
+  const { baselineUsd } = await ensureReconcileBaseline(pool.realBalanceUsd);
+
+  /* 手工调整不改变上游，但它确实动了卡密余额，所以从应有余额里扣掉，
+     避免老板手动加过钱之后被误判成漂移 */
+  const expectedUsd = baselineUsd.minus(netConsumed).minus(manualAdjusted);
+  const drift = pool.realBalanceUsd.minus(expectedUsd);
   const ok = drift.abs().lte(dec(RECONCILE_TOLERANCE_USD));
   const message = ok
     ? null
-    : `账本漂移 ${drift.toFixed(4)} USD（真实 ${pool.realBalanceUsd.toFixed(2)} / 账本 ${ledgerUsd.toFixed(2)}）`;
+    : `合计差 ${drift.toFixed(4)} USD（真实 ${pool.realBalanceUsd.toFixed(2)} / 应有 ${expectedUsd.toFixed(2)}）`;
+
+  const ledgerUsd = expectedUsd;
 
   const activeCount = await prisma.activation.count({ where: { status: "waiting" } });
   await prisma.grizzlySnapshot.create({
@@ -447,13 +554,52 @@ export async function runReconcile(
   return {
     ok,
     realUsd: pool.realBalanceUsd.toFixed(2),
-    ledgerUsd: ledgerUsd.toFixed(2),
+    ledgerUsd: expectedUsd.toFixed(2),
     driftUsd: drift.toFixed(4),
+    baselineUsd: baselineUsd.toFixed(2),
+    netConsumedUsd: netConsumed.toFixed(2),
+    manualAdjustedUsd: manualAdjusted.toFixed(2),
     allocatedUsd: pool.allocatedUsd.toFixed(2),
     availableUsd: pool.availableUsd.toFixed(2),
     source: pool.source,
     message,
   };
+}
+
+/**
+ * 校准：把当前差额并入基准，使对账归零。
+ *
+ * 用途：老板手动给 Grizzly 充过值 / 在上游买过东西后，差额是**真实且合理**的，
+ * 记下来即可。校准不修改任何卡密余额与流水，只调整基准这一个数。
+ */
+export async function calibrateBaseline(): Promise<{ baselineUsd: string; driftBefore: string }> {
+  const prisma = getPrisma();
+  const pool = await getPoolState();
+  const netConsumed = await getNetConsumedUsd(prisma);
+  const manualAdjusted = await getManualAdjustedUsd(prisma);
+  const { baselineUsd } = await ensureReconcileBaseline(pool.realBalanceUsd);
+
+  const expected = baselineUsd.minus(netConsumed).minus(manualAdjusted);
+  const drift = pool.realBalanceUsd.minus(expected);
+  /* 新基准 = 真实余额 + 净消耗 + 手工调整（即让 expected 恰好等于真实） */
+  const next = pool.realBalanceUsd.plus(netConsumed).plus(manualAdjusted);
+
+  await prisma.reconcileBaseline.upsert({
+    where: { id: "singleton" },
+    create: {
+      id: "singleton",
+      baselineUsd: toStorageString(next),
+      consumedAtSetUsd: toStorageString(netConsumed),
+      note: `校准（原差额 ${drift.toFixed(4)}）`,
+    },
+    update: {
+      baselineUsd: toStorageString(next),
+      consumedAtSetUsd: toStorageString(netConsumed),
+      note: `校准（原差额 ${drift.toFixed(4)}）`,
+    },
+  });
+
+  return { baselineUsd: next.toFixed(2), driftBefore: drift.toFixed(4) };
 }
 
 export interface IssueCardKeysInput {
