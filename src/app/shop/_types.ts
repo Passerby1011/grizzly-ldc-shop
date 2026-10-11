@@ -60,6 +60,8 @@ export interface PollView {
   cancelAvailableInSeconds: number;
   /** 可取消的时间点（ISO 时间戳）。 */
   cancelLockedUntil: string;
+  /** true = 这道锁来自"上次取消失败"的重试冷却。 */
+  cancelRetryLocked: boolean;
 }
 
 export interface OrderQueryView {

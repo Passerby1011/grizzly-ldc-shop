@@ -329,6 +329,8 @@ export interface PollActivationResult {
   cancelAvailableInSeconds: number;
   /** 可取消的时间点（ISO 时间戳）。 */
   cancelLockedUntil: string;
+  /** true = 这道锁来自"上次取消失败"的重试冷却，不是取号后的初始锁。 */
+  cancelRetryLocked: boolean;
   /**
    * 距「超时自动回收」的剩余秒数；null = 未开启自动回收（autoCancelMinutes = 0）。
    * 从**本号码自己的取号时间**算起，与巡检频率无关。
@@ -455,12 +457,23 @@ async function fetchSmsText(grizzly: GrizzlyClient, grizzlyId: string): Promise<
 }
 
 function toPollResult(
-  activation: { id: string; status: string; code: string | null; smsText: string | null; phone: string; costUsd: unknown; reservedUsd: unknown; createdAt: Date },
+  activation: {
+    id: string;
+    status: string;
+    code: string | null;
+    smsText: string | null;
+    phone: string;
+    costUsd: unknown;
+    reservedUsd: unknown;
+    createdAt: Date;
+    /* 上次取消失败后的重试锁；没有则为 null */
+    cancelRetryAt?: Date | null;
+  },
   hint: string | null,
   autoCancelMinutes = 0,
 ): PollActivationResult {
   const cost = activation.costUsd ?? activation.reservedUsd;
-  const window = cancelWindow(activation.createdAt);
+  const window = cancelWindow(activation.createdAt, activation.cancelRetryAt ?? null);
   const auto = autoCancelWindow(activation.createdAt, autoCancelMinutes);
   return {
     activationId: activation.id,
@@ -473,15 +486,22 @@ function toPollResult(
     balanceUsd: null,
     cancelAvailableInSeconds: window.cancelAvailableInSeconds,
     cancelLockedUntil: window.cancelLockedUntil,
+    cancelRetryLocked: window.cancelRetryLocked,
     autoCancelInSeconds: auto.autoCancelInSeconds,
     autoCancelAt: auto.autoCancelAt,
   };
 }
 
 /**
- * 取消锁：取号后 CANCEL_LOCK_SECONDS 内不可取消（实测约 60s 会被上游拒绝）。
- * 由 `Activation.createdAt + CANCEL_LOCK_SECONDS` 服务端计算，刷新页面也不会丢。
- */
+ * 取消解锁时刻 = max(取号时间 + CANCEL_LOCK_SECONDS, 上次失败的重试锁)。
+ *
+ * 两道锁：
+ *   ① 初始锁：取号后 CANCEL_LOCK_SECONDS 内不给取消（上游本来就会拒）。
+ *   ② 重试锁：第一次被上游拒（EARLY_CANCEL_DENIED）后，再锁 max(重试秒数)，
+ *      到点提示买家再试。因为上游解锁时机不可预测（实测 64s~334s 浮动），
+ *      既不能让他连点刷上游，也不能骗他说"马上就好"。
+ *
+ * 全部由服务端根据库里的时间戳算，刷新页面/换设备都不会丢。
 /**
  * 超时回收窗口：从**本号码的取号时间**算起 autoCancelMinutes 分钟。
  *
@@ -502,11 +522,19 @@ function autoCancelWindow(
   };
 }
 
-function cancelWindow(createdAt: Date): { cancelAvailableInSeconds: number; cancelLockedUntil: string } {
-  const lockUntilMs = createdAt.getTime() + getConfig().CANCEL_LOCK_SECONDS * 1000;
+function cancelWindow(
+  createdAt: Date,
+  cancelRetryAt: Date | null = null,
+): { cancelAvailableInSeconds: number; cancelLockedUntil: string; cancelRetryLocked: boolean } {
+  const initialMs = createdAt.getTime() + getConfig().CANCEL_LOCK_SECONDS * 1000;
+  const retryMs = cancelRetryAt ? cancelRetryAt.getTime() : 0;
+  const lockUntilMs = Math.max(initialMs, retryMs);
+  const now = Date.now();
   return {
-    cancelAvailableInSeconds: Math.max(0, Math.ceil((lockUntilMs - Date.now()) / 1000)),
+    cancelAvailableInSeconds: Math.max(0, Math.ceil((lockUntilMs - now) / 1000)),
     cancelLockedUntil: new Date(lockUntilMs).toISOString(),
+    /* true = 当前这道锁是"上次取消失败"留下的，前端据此换话术 */
+    cancelRetryLocked: retryMs > initialMs && now < retryMs,
   };
 }
 
@@ -541,13 +569,23 @@ export async function cancelActivation(input: {
     throw conflict(ERROR_CODES.CONFLICT, `激活状态为 ${activation.status}，无法取消`);
   }
 
-  /* 本地闸门：取号后 CANCEL_LOCK_SECONDS 内直接拒绝，不打扰上游。 */
+  /* 本地闸门：初始锁 或 上次失败的重试锁 未到期 → 直接拒绝，不打扰上游。 */
+  const settings = await getSiteSettings();
   const lockSeconds = getConfig().CANCEL_LOCK_SECONDS;
-  const lockUntil = activation.createdAt.getTime() + lockSeconds * 1000;
+  const initialMs = activation.createdAt.getTime() + lockSeconds * 1000;
+  const retryMs = activation.cancelRetryAt ? activation.cancelRetryAt.getTime() : 0;
+  const lockUntil = Math.max(initialMs, retryMs);
   if (Date.now() < lockUntil) {
-    throw conflict(ERROR_CODES.CONFLICT, `取号后需等待 ${lockSeconds} 秒才能取消`, {
-      retryAfterSeconds: Math.ceil((lockUntil - Date.now()) / 1000),
-    });
+    const wait = Math.ceil((lockUntil - Date.now()) / 1000);
+    /* 重试锁生效时给更贴切的话术：不是"刚取号"，而是"上游还没解锁" */
+    const isRetryLock = retryMs > initialMs && Date.now() < retryMs;
+    throw conflict(
+      ERROR_CODES.CONFLICT,
+      isRetryLock
+        ? `上游还未解锁取消，请等待倒计时结束后再点（约 ${Math.ceil(wait / 60)} 分钟）`
+        : `取号后需等待 ${lockSeconds} 秒才能取消`,
+      { retryAfterSeconds: wait, retryLock: isRetryLock },
+    );
   }
 
   const grizzly = input.grizzly ?? getGrizzlyClient();
@@ -565,11 +603,37 @@ export async function cancelActivation(input: {
       throw conflict(ERROR_CODES.CONFLICT, "上游已完成激活，无法取消");
     }
     if (state?.state !== "CANCEL") {
-      /* 上游仍拒绝过早取消（如其它服务阈值更高）→ 409 + 可读中文，绝不冒泡成 UNKNOWN */
+      /*
+       * 上游仍拒绝过早取消 → 落一个"重试锁"，让买家等一会儿再点。
+       *
+       * 为什么不能只回个 15 秒：上游解锁取消的时机不可预测（实测取消窗口
+       * 64s~334s 浮动，按供应商/服务变），回 15 秒会让买家连点十几次全失败，
+       * 既刷上游又像"按钮坏了"。锁 2~3 分钟并明确告知，体验和上游压力都合理。
+       */
       if (error instanceof GrizzlyApiError && error.code === "EARLY_CANCEL_DENIED") {
-        throw conflict(ERROR_CODES.CONFLICT, "上游暂不允许取消，请稍后再试", {
-          retryAfterSeconds: 15,
+        const configured = Number(settings.cancelRetrySeconds);
+        const retrySeconds = Math.max(
+          30,
+          Number.isFinite(configured) ? Math.floor(configured) : DEFAULT_CANCEL_RETRY_SECONDS,
+        );
+        const retryAt = new Date(Date.now() + retrySeconds * 1000);
+        await prisma.activation.update({
+          where: { id: activation.id },
+          data: {
+            cancelRetryAt: retryAt,
+            cancelAttempts: { increment: 1 },
+          },
         });
+        const minutes = Math.max(1, Math.round(retrySeconds / 60));
+        throw conflict(
+          ERROR_CODES.CONFLICT,
+          `上游还没解锁取消，约 ${minutes} 分钟后可以再试一次`,
+          {
+            retryAfterSeconds: retrySeconds,
+            retryLock: true,
+            retryAt: retryAt.toISOString(),
+          },
+        );
       }
       throw error;
     }
@@ -751,6 +815,13 @@ const SWEEP_MIN_INTERVAL_MS = 20_000;
  * 明确 CANCEL，才认定"这号不可能再出码"并退款，避免刚取号就误判退款。
  */
 const DEFAULT_CONFIRM_CANCEL_MINUTES = 6;
+
+/**
+ * 取消失败后的重试锁兜底秒数（设置层读不到时用）。
+ * 必须有兜底：settings.cancelRetrySeconds 缺失会让 Date 变 Invalid，
+ * 抛 RangeError 把一次普通的"上游未解锁"变成 500。
+ */
+const DEFAULT_CANCEL_RETRY_SECONDS = 150;
 
 /**
  * 机会式巡检：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。

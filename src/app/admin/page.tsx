@@ -209,6 +209,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const [rate, setRate] = useState("");
   const [markup, setMarkup] = useState("");
   const [lock, setLock] = useState("");
+  const [retry, setRetry] = useState("");
   const [buffer, setBuffer] = useState("");
   const [presets, setPresets] = useState("");
 
@@ -217,6 +218,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
     setRate(data.effective.rateLdcPerUsd);
     setMarkup(String(data.effective.markupPct));
     setLock(String(data.effective.cancelLockSeconds));
+    setRetry(String(data.effective.cancelRetrySeconds));
     setBuffer(data.effective.safetyBufferUsd);
     setPresets(data.effective.faceValuePresets.join(", "));
   }, []);
@@ -244,6 +246,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
         rateLdcPerUsd: rate,
         markupPct: markup,
         cancelLockSeconds: lock,
+        cancelRetrySeconds: retry,
         safetyBufferUsd: buffer,
         faceValuePresets: list,
       });
@@ -296,6 +299,15 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
       hint: view.hints.cancelLockSeconds,
       fallback: String(view.envFallback.cancelLockSeconds),
       touched: "cancel_lock_seconds" in view.fromDb,
+    },
+    {
+      key: "cancel_retry_seconds",
+      label: "取消失败重试锁（秒）",
+      value: retry,
+      set: setRetry,
+      hint: view.hints.cancelRetrySeconds,
+      fallback: String(view.envFallback.cancelRetrySeconds),
+      touched: "cancel_retry_seconds" in view.fromDb,
     },
     {
       key: "safety_buffer_usd",

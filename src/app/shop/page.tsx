@@ -45,6 +45,14 @@ function formatCountdown(seconds: number): string {
   return `${minutes}:${rest}`;
 }
 
+/** 从 409 的 details 里取 retryLock（true = 这是"上游未解锁"的重试冷却）。 */
+function retryLockOf(error: unknown): boolean {
+  if (!(error instanceof ApiCallError)) return false;
+  const details = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  return (details as { retryLock?: unknown }).retryLock === true;
+}
+
 /** 从 409 的 details 里取 retryAfterSeconds（服务端建议的重试等待秒数）。 */
 function retryAfterSecondsOf(error: unknown): number | null {
   if (!(error instanceof ApiCallError)) return null;
@@ -82,6 +90,13 @@ export default function ShopPage() {
   const [cancelLeft, setCancelLeft] = useState<number | null>(null);
   /** 本轮倒计时的起始总秒数，用于算进度条百分比。 */
   const [cancelTotal, setCancelTotal] = useState<number | null>(null);
+  /**
+   * 当前这道锁是不是"上次取消失败"留下的重试冷却。
+   * 是的话文案要换 —— 不是"刚取号不能取消"，而是"上游还没解锁"。
+   */
+  const [cancelRetryLocked, setCancelRetryLocked] = useState(false);
+  /** 取消失败后的额外说明（比通用错误更贴近场景）。 */
+  const [cancelHint, setCancelHint] = useState<string | null>(null);
   /** 复制按钮的瞬时反馈。 */
   const [copied, setCopied] = useState(false);
   /** 估价请求序号：递增后丢弃过期响应，避免乱序覆盖。 */
@@ -283,6 +298,7 @@ export default function ShopPage() {
   /* 取消倒计时以服务端返回的剩余秒数为准（刷新页面也不丢），本地每秒递减 */
   useEffect(() => {
     if (poll && Number.isFinite(poll.cancelAvailableInSeconds)) {
+      setCancelRetryLocked(Boolean(poll.cancelRetryLocked));
       setCancelLeft(poll.cancelAvailableInSeconds);
       setCancelTotal((prev) =>
         prev === null || poll.cancelAvailableInSeconds > prev ? poll.cancelAvailableInSeconds : prev,
@@ -403,6 +419,8 @@ export default function ShopPage() {
     });
     setActivation(view);
     setPoll(null);
+    setCancelHint(null);
+    setCancelRetryLocked(false);
     /* 记住它，刷新后还能接着等码 */
     try {
       window.localStorage.setItem(ACTIVE_KEY_STORAGE, view.activationId);
@@ -423,6 +441,8 @@ export default function ShopPage() {
       setPoll((prev) => (prev ? { ...prev, status: "cancelled" } : prev));
       setCancelLeft(0);
       setCancelTotal(null);
+      setCancelHint(null);
+      setCancelRetryLocked(false);
       if (result.balanceUsd) {
         setSession((prev) => (prev ? { ...prev, balanceUsd: result.balanceUsd as string } : prev));
       }
@@ -431,9 +451,18 @@ export default function ShopPage() {
       /* 服务端 409 带 retryAfterSeconds：重置倒计时 + 可读提示 */
       const retryAfter = retryAfterSecondsOf(error);
       if (retryAfter !== null) {
+        const isRetryLock = retryLockOf(error);
         setCancelLeft(retryAfter);
         setCancelTotal(retryAfter);
+        setCancelRetryLocked(isRetryLock);
         setNotice(null);
+        if (isRetryLock) {
+          /* 上游解锁时机不可预测，明确告诉买家"等倒计时结束再点"，别连点 */
+          setError(null);
+          setCancelHint(
+            `上游还没解锁取消窗口（各服务解锁时间不同，通常 1~5 分钟）。请在倒计时结束后再点一次。`,
+          );
+        }
       }
       throw error;
     }
@@ -787,11 +816,18 @@ export default function ShopPage() {
               {cancelPending && cancelLeft !== null ? (
                 <div className="space-y-1.5" aria-live="polite">
                   <div className="flex items-baseline justify-between">
-                    <span className="faint">上游锁定中，暂不可取消</span>
+                    <span className="faint">
+                      {cancelRetryLocked ? "上游暂未解锁，冷却中" : "上游锁定中，暂不可取消"}
+                    </span>
                     <span className="tnum text-sm font-medium" style={{ color: "rgb(var(--warn))" }}>
                       {formatCountdown(cancelLeft)}
                     </span>
                   </div>
+                  {cancelHint ? (
+                    <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--fg-muted))" }}>
+                      {cancelHint}
+                    </p>
+                  ) : null}
                   <div className="progress-track">
                     <div
                       className="progress-fill"
@@ -820,7 +856,29 @@ export default function ShopPage() {
                 {cancelLabel}
               </button>
               {cancelPending ? (
-                <p className="faint">上游取号后约 60 秒内不允许取消，倒计时归零后按钮会自动启用。</p>
+                cancelRetryLocked ? (
+                  /*
+                   * 重试冷却：上游解锁时机不可预测（实测 64s~334s 浮动，按服务变），
+                   * 所以要明确告诉买家"不是坏了，是还没到时间"，并给出下次动作。
+                   */
+                  <div
+                    className="space-y-1 rounded-lg p-2.5"
+                    style={{
+                      border: "1px solid rgb(var(--warn) / 0.35)",
+                      background: "rgb(var(--warn) / 0.07)",
+                    }}
+                  >
+                    <p className="text-xs font-medium" style={{ color: "rgb(var(--warn))" }}>
+                      上次取消被上游拒绝
+                    </p>
+                    <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--fg-muted))" }}>
+                      上游还没开放取消（各服务解锁时间不同，一般 1~5 分钟）。
+                      倒计时结束后请<strong>再点一次</strong>「取消并回补」。
+                    </p>
+                  </div>
+                ) : (
+                  <p className="faint">上游取号后约 60 秒内不允许取消，倒计时归零后按钮会自动启用。</p>
+                )
               ) : (
                 <p className="faint">取消成功后，本次预扣金额会全额回补到卡密余额。</p>
               )}

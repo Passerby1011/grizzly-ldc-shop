@@ -18,6 +18,7 @@ export type SettingKey =
   | "rate_ldc_per_usd"
   | "markup_pct"
   | "cancel_lock_seconds"
+  | "cancel_retry_seconds"
   | "safety_buffer_usd"
   | "auto_cancel_minutes"
   | "face_value_presets";
@@ -26,6 +27,7 @@ export const SETTING_KEYS: readonly SettingKey[] = [
   "rate_ldc_per_usd",
   "markup_pct",
   "cancel_lock_seconds",
+  "cancel_retry_seconds",
   "safety_buffer_usd",
   "auto_cancel_minutes",
   "face_value_presets",
@@ -42,6 +44,7 @@ const KEY_TO_FIELD: Record<SettingKey, keyof SiteSettings> = {
   rate_ldc_per_usd: "rateLdcPerUsd",
   markup_pct: "markupPct",
   cancel_lock_seconds: "cancelLockSeconds",
+  cancel_retry_seconds: "cancelRetrySeconds",
   safety_buffer_usd: "safetyBufferUsd",
   auto_cancel_minutes: "autoCancelMinutes",
   face_value_presets: "faceValuePresets",
@@ -54,6 +57,13 @@ export interface SiteSettings {
   markupPct: number;
   /** 取号后可取消的最短等待秒数（实测上游约 60s 拒绝 EARLY_CANCEL_DENIED）。 */
   cancelLockSeconds: number;
+  /**
+   * 取消失败后的重试锁定秒数（默认 150 = 2.5 分钟）。
+   *
+   * 上游解锁时机不可预测（实测 64s~334s 浮动）。第一次被拒后锁一小段时间，
+   * 到点提示买家再试，避免连点刷上游。
+   */
+  cancelRetrySeconds: number;
   /** 不可被动用的安全缓冲（美元），防账本推算与真实余额偏差导致超卖。 */
   safetyBufferUsd: Decimal;
   /**
@@ -88,6 +98,7 @@ const HARD_DEFAULTS: {
   rateLdcPerUsd: number;
   markupPct: number;
   cancelLockSeconds: number;
+  cancelRetrySeconds: number;
   safetyBufferUsd: number;
   autoCancelMinutes: number;
   faceValuePresets: number[];
@@ -95,6 +106,7 @@ const HARD_DEFAULTS: {
   rateLdcPerUsd: 1.1,
   markupPct: 0,
   cancelLockSeconds: 90,
+  cancelRetrySeconds: 150,
   safetyBufferUsd: 0.5,
   autoCancelMinutes: 0,
   faceValuePresets: [1, 3, 5, 10],
@@ -126,6 +138,7 @@ export function getEnvFallbackSettings(): SiteSettings {
   let rate = HARD_DEFAULTS.rateLdcPerUsd;
   let markup = HARD_DEFAULTS.markupPct;
   let lock = HARD_DEFAULTS.cancelLockSeconds;
+  let retry = HARD_DEFAULTS.cancelRetrySeconds;
   let buffer = HARD_DEFAULTS.safetyBufferUsd;
   let autoCancel = HARD_DEFAULTS.autoCancelMinutes;
   let presets = [...HARD_DEFAULTS.faceValuePresets];
@@ -135,6 +148,7 @@ export function getEnvFallbackSettings(): SiteSettings {
     rate = envNumber(HARD_DEFAULTS.rateLdcPerUsd, String(cfg.RATE_LDC_PER_USD));
     markup = envNumber(HARD_DEFAULTS.markupPct, String(cfg.MARKUP_PCT));
     lock = envNumber(HARD_DEFAULTS.cancelLockSeconds, String(cfg.CANCEL_LOCK_SECONDS));
+    retry = envNumber(HARD_DEFAULTS.cancelRetrySeconds, process.env.CANCEL_RETRY_SECONDS);
     buffer = envNumber(HARD_DEFAULTS.safetyBufferUsd, String(cfg.SAFETY_BUFFER_USD));
     autoCancel = envNumber(HARD_DEFAULTS.autoCancelMinutes, process.env.AUTO_CANCEL_MINUTES);
     presets = parsePresets(process.env.FACE_VALUE_PRESETS);
@@ -146,6 +160,7 @@ export function getEnvFallbackSettings(): SiteSettings {
     rateLdcPerUsd: dec(rate),
     markupPct: markup,
     cancelLockSeconds: lock,
+    cancelRetrySeconds: retry,
     safetyBufferUsd: dec(buffer),
     autoCancelMinutes: autoCancel,
     faceValuePresets: presets,
@@ -172,6 +187,12 @@ function parseDbValue(key: SettingKey, raw: string, base: SiteSettings): Partial
       const n = Number(raw);
       if (!Number.isFinite(n) || n < 0 || n > 3600) return {};
       return { cancelLockSeconds: Math.floor(n) };
+    }
+    case "cancel_retry_seconds": {
+      const n = Number(raw);
+      /* 0 = 不锁（不做冷却）；上限 1 小时 */
+      if (!Number.isFinite(n) || n < 0 || n > 3600) return {};
+      return { cancelRetrySeconds: Math.floor(n) };
     }
     case "safety_buffer_usd": {
       const n = Number(raw);
@@ -272,6 +293,8 @@ function serialize(key: SettingKey, next: SiteSettings): string {
       return String(next.markupPct);
     case "cancel_lock_seconds":
       return String(Math.floor(next.cancelLockSeconds));
+    case "cancel_retry_seconds":
+      return String(Math.floor(next.cancelRetrySeconds));
     case "safety_buffer_usd":
       return toStorageString(next.safetyBufferUsd);
     case "auto_cancel_minutes":
@@ -293,6 +316,8 @@ export async function updateSiteSettings(patch: Partial<SiteSettings>): Promise<
     markupPct: patch.markupPct !== undefined ? patch.markupPct : current.markupPct,
     cancelLockSeconds:
       patch.cancelLockSeconds !== undefined ? Math.floor(patch.cancelLockSeconds) : current.cancelLockSeconds,
+    cancelRetrySeconds:
+      patch.cancelRetrySeconds !== undefined ? Math.floor(patch.cancelRetrySeconds) : current.cancelRetrySeconds,
     safetyBufferUsd:
       patch.safetyBufferUsd !== undefined ? dec(patch.safetyBufferUsd) : current.safetyBufferUsd,
     autoCancelMinutes:

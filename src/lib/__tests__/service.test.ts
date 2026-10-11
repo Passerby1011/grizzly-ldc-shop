@@ -33,7 +33,7 @@ vi.mock("../settings", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../settings")>();
   return {
     ...actual,
-    getSiteSettings: vi.fn(async () => ({ autoCancelMinutes: 16 })),
+    getSiteSettings: vi.fn(async () => ({ autoCancelMinutes: 16, cancelRetrySeconds: 150 })),
   };
 });
 
@@ -62,6 +62,8 @@ function activationRow(overrides: Record<string, unknown> = {}) {
     code: null,
     smsText: null,
     lastPolledAt: null,
+    cancelRetryAt: null,
+    cancelAttempts: 0,
     createdAt: new Date(),
     closedAt: null,
     ...overrides,
@@ -151,7 +153,61 @@ describe("cancelActivation：本地取消闸门（CANCEL_LOCK_SECONDS）", () =>
     expect(caught).toBeInstanceOf(ApiError);
     const apiError = caught as ApiError;
     expect(apiError.status).toBe(409);
-    expect((apiError.details as { retryAfterSeconds: number }).retryAfterSeconds).toBe(15);
+    /* 不再是"15 秒后再试"，而是锁 2.5 分钟（可后台配） */
+    expect((apiError.details as { retryAfterSeconds: number }).retryAfterSeconds).toBe(150);
+    expect((apiError.details as { retryLock?: boolean }).retryLock).toBe(true);
+    /* 失败必须落盘：下次进来靠它继续挡住，不重复打扰上游 */
+    const upd = mocks.activation.update.mock.calls.at(-1)?.[0] as
+      | { data?: { cancelRetryAt?: Date; cancelAttempts?: unknown } }
+      | undefined;
+    expect(upd?.data?.cancelRetryAt).toBeInstanceOf(Date);
+    expect(upd?.data?.cancelAttempts).toEqual({ increment: 1 });
+  });
+
+  it("重试锁生效期间再次点取消 → 409，且绝不打扰上游", async () => {
+    mocks.activation.findUnique.mockResolvedValue(
+      activationRow({
+        /* 取号已久（初始锁早过期），但上次失败留下了重试锁 */
+        createdAt: new Date(Date.now() - 10 * 60_000),
+        cancelRetryAt: new Date(Date.now() + 120_000),
+      }),
+    );
+    const grizzly = grizzlyStub();
+
+    const caught = await cancelActivation({
+      keyId: "key1",
+      activationId: "act1",
+      grizzly: grizzly.client,
+    }).catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).status).toBe(409);
+    const details = (caught as ApiError).details as { retryAfterSeconds: number; retryLock?: boolean };
+    expect(details.retryLock).toBe(true);
+    expect(details.retryAfterSeconds).toBeGreaterThan(100);
+    /* 关键：本地挡掉，一次上游调用都不发 */
+    expect(grizzly.setStatus).not.toHaveBeenCalled();
+  });
+
+  it("重试锁到期后放行到上游", async () => {
+    mocks.activation.findUnique.mockResolvedValue(
+      activationRow({
+        createdAt: new Date(Date.now() - 10 * 60_000),
+        cancelRetryAt: new Date(Date.now() - 1000),
+      }),
+    );
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    const grizzly = grizzlyStub();
+    grizzly.setStatus.mockResolvedValue("ACCESS_CANCEL");
+
+    const r = await cancelActivation({
+      keyId: "key1",
+      activationId: "act1",
+      grizzly: grizzly.client,
+    });
+
+    expect(grizzly.setStatus).toHaveBeenCalled();
+    expect(r.status).toBe("cancelled");
   });
 });
 

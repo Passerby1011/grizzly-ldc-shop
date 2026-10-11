@@ -153,6 +153,7 @@ export interface SiteSettingsValues {
   rateLdcPerUsd: string;
   markupPct: number;
   cancelLockSeconds: number;
+  cancelRetrySeconds: number;
   safetyBufferUsd: string;
   faceValuePresets: number[];
 }

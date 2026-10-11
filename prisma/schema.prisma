@@ -93,6 +93,17 @@ model Activation {
   code        String?
   smsText     String?
   lastPolledAt DateTime?
+  /**
+   * 取消失败后的"重试锁定到期时间"。
+   *
+   * 为什么要有：上游什么时候解锁取消窗口是不可预测的（实测 64s~334s 浮动，
+   * 按供应商变）。买家第一次点取消若被上游拒绝，我们不能让他疯狂连点，
+   * 也不能骗他说"马上就好"—— 而是锁定一小段时间，到点后提示他再试。
+   * 记在服务端，刷新页面也不会丢。
+   */
+  cancelRetryAt DateTime?
+  /** 取消尝试次数：第一次失败后用更长的重试锁。 */
+  cancelAttempts Int      @default(0)
   createdAt   DateTime  @default(now())
   closedAt    DateTime?
 
