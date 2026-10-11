@@ -746,6 +746,13 @@ let lastSweepAt = 0;
 const SWEEP_MIN_INTERVAL_MS = 20_000;
 
 /**
+ * 弃单核账的「退款确认窗口」（分钟）。
+ * 上游取号后处于可取消态的窗口实测 64s~334s 浮动；只有过了这个时间、且上游
+ * 明确 CANCEL，才认定"这号不可能再出码"并退款，避免刚取号就误判退款。
+ */
+const DEFAULT_CONFIRM_CANCEL_MINUTES = 6;
+
+/**
  * 机会式巡检：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。
  * 纯兜底，真正的频率保证靠 /api/cron/sweep 由外部定时器打。
  */
@@ -755,6 +762,25 @@ export async function maybeSweepStaleActivations(): Promise<SweepResult | null> 
   lastSweepAt = now;
   try {
     return await sweepStaleActivations();
+  } catch {
+    return null;
+  }
+}
+
+let lastReconcileAt = 0;
+/** 弃单核账的机会式间隔：比 sweep 保守，因为它对每个 waiting 都要打一次上游。 */
+const RECONCILE_MIN_INTERVAL_MS = 60_000;
+
+/**
+ * 机会式弃单核账：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。
+ * 主路径仍是买家轮询；这里只负责捞**买家走开后就没人管**的那些。
+ */
+export async function maybeReconcileAbandoned(): Promise<Awaited<ReturnType<typeof reconcileAbandonedActivations>> | null> {
+  const now = Date.now();
+  if (now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) return null;
+  lastReconcileAt = now;
+  try {
+    return await reconcileAbandonedActivations();
   } catch {
     return null;
   }
@@ -807,14 +833,14 @@ async function recycleOneActivation(activationId: string): Promise<"recycled" | 
     return "completed";
   }
 
-  /* 上游已取消 → 本地收口，同样不回补 */
-  if (state.state === "CANCEL") {
-    const claimed = await prisma.activation.updateMany({
-      where: { id: activationId, status: "waiting" },
-      data: { status: "expired", closedAt: new Date() },
-    });
-    return claimed.count > 0 ? "recycled" : "skipped";
-  }
+  /*
+   * 上游已取消 → **不在这里处理，交给 reconcileAbandonedActivations 退款**。
+   *
+   * 为什么跳过而不是像以前那样标 expired：上游取消意味着号不可能再出码，
+   * 钱也已被上游退回主账号，此时应当把卡密余额退回买家（老板 2026-10-11 定）。
+   * 退款口径只保留在 reconciler 一处，避免两条路径给出不同结果。
+   */
+  if (state.state === "CANCEL") return "skipped";
 
   /* 主动取消，释放上游占用（上游退款给卖家，但不回补卡密余额） */
   try {
@@ -828,6 +854,110 @@ async function recycleOneActivation(activationId: string): Promise<"recycled" | 
     data: { status: "expired", closedAt: new Date() },
   });
   return claimed.count > 0 ? "recycled" : "skipped";
+}
+
+/**
+ * 核对「被遗弃」的激活：本地还挂着 waiting，但上游其实已经有结果了。
+ *
+ * 为什么必须有这个：本地激活状态**只靠买家浏览器轮询来更新**。买家一切走
+ * —— 去开第二个号、点了取消但没等、或者直接关页面 —— 轮询就停了，本地记录
+ * 永远冻在 waiting。而上游那边早就出了码、或者自己取消了（ACCESS_CANCEL
+ * 把钱退回主账号）。这些钱就白白卡在激活记录里，谁也不知道。
+ *
+ * 实测（2026-10-11，老板发现）：wa/151 那笔 $0.12 卡了一整天，上游状态
+ * STATUS_CANCEL、上游余额只少了成功那笔的 $0.15，但本地一直是 waiting。
+ *
+ * 与 sweepStaleActivations 的区别（**计费口径完全相反，别混**）：
+ *   sweepStaleActivations          我们主动回收超时号 → 不退卡密余额
+ *   reconcileAbandonedActivations  上游出的结果 → 出码就补记、上游取消就退款
+ *
+ * 触发方式：/api/cron/sweep（外部定时器，配 CONFIRM_CANCEL_MINUTES）+
+ * 轮询接口机会式兜底。做成「按上游实际状态收口」而不是「按超时时间猜」，
+ * 所以独立于 autoCancelMinutes 开关 —— 老板可以关掉主动回收，但弃单核账
+ * 属于资金安全，必须常开。
+ *
+ * 安全闸门：只有当「上游已经取消 且 取号后已超过 confirmCancelMinutes」时才退款。
+ * 因为刚取号那几十秒里上游可能处于可取消态（实测取消窗口 64s~334s 浮动），
+ * 一旦上游取消，这号就不可能再出码了 —— 此时退款把钱还给买家、同时把
+ * ACCESS_CANCEL 从上游拿回的钱留给主账号。两边都不亏。
+ *
+ * 幂等：cancelActivationInternal 内部用条件 UPDATE（waiting → cancelled）抢占，
+ * 重复跑不会重复退款。
+ */
+export async function reconcileAbandonedActivations(limit = 20): Promise<{
+  scanned: number;
+  completed: number;
+  refunded: number;
+  refundedUsd: string;
+  skipped: number;
+  errors: number;
+}> {
+  const prisma = getPrisma();
+  const result = { scanned: 0, completed: 0, refunded: 0, refundedUsd: "0.00", skipped: 0, errors: 0 };
+
+  const waiting = await prisma.activation.findMany({
+    where: { status: "waiting" },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+  if (!waiting.length) return result;
+  result.scanned = waiting.length;
+
+  const confirmMs = DEFAULT_CONFIRM_CANCEL_MINUTES * 60_000;
+
+  const grizzly = getGrizzlyClient();
+  let refundedTotal = dec(0);
+
+  for (const activation of waiting) {
+    let state: ParsedStatus;
+    try {
+      state = await grizzly.getStatus(activation.grizzlyId);
+    } catch {
+      result.errors += 1;
+      continue;
+    }
+
+    /* 上游其实已经出码了 → 补记，绝不让买家的码丢掉 */
+    if (state.state === "OK") {
+      const claimed = await prisma.activation.updateMany({
+        where: { id: activation.id, status: "waiting" },
+        data: { status: "ok", code: state.code, closedAt: new Date() },
+      });
+      if (claimed.count > 0) result.completed += 1;
+      else result.skipped += 1;
+      continue;
+    }
+
+    /* 上游已取消 → 过了安全窗口就把钱退回卡密（老板 2026-10-11 定的口径） */
+    if (state.state === "CANCEL") {
+      const ageMs = Date.now() - activation.createdAt.getTime();
+      if (ageMs < confirmMs) {
+        result.skipped += 1;
+        continue;
+      }
+      try {
+        const r = await cancelActivationInternal(activation.id, "upstream");
+        if (Number(r.refundedUsd) > 0) {
+          refundedTotal = refundedTotal.plus(dec(r.refundedUsd));
+          result.refunded += 1;
+        } else {
+          result.skipped += 1;
+        }
+      } catch {
+        result.errors += 1;
+      }
+      continue;
+    }
+
+    /* 其余（WAIT_*、stale 等）留给主动回收逻辑，不在这里动 */
+    result.skipped += 1;
+  }
+
+  result.refundedUsd = refundedTotal.toFixed(2);
+  if (result.refunded || result.completed) {
+    console.log("[reconcile-abandoned]", JSON.stringify(result));
+  }
+  return result;
 }
 
 export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {

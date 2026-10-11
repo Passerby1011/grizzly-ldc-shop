@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { jsonOk, readQuery, requireSession, withRoute } from "@/lib/http";
-import { pollActivation, maybeSweepStaleActivations } from "@/lib/service";
+import { pollActivation, maybeSweepStaleActivations, maybeReconcileAbandoned } from "@/lib/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,6 +19,8 @@ export const GET = withRoute(async (request: Request) => {
    * 真正的频率保证靠 /api/cron/sweep 由外部定时器打（Hobby cron 每天只有 1 次）。
    */
   void maybeSweepStaleActivations();
+  /* 弃单核账：买家走开后没人轮询的那些，靠这里机会式收口（上游出码补记 / 上游取消退款） */
+  void maybeReconcileAbandoned();
 
   return jsonOk(result);
 });

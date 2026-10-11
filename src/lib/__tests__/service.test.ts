@@ -4,7 +4,7 @@ import { GRIZZLY_STATUS, GrizzlyApiError, type GrizzlyClient } from "../grizzly"
 import { ApiError } from "../http";
 import { readFileSync } from "node:fs";
 import { getEnvFallbackSettings } from "../settings";
-import { cancelActivation, pollActivation, sweepStaleActivations } from "../service";
+import { cancelActivation, pollActivation, reconcileAbandonedActivations, sweepStaleActivations } from "../service";
 
 const mocks = vi.hoisted(() => {
   const activation = {
@@ -285,15 +285,18 @@ describe("sweepStaleActivations：保底回收", () => {
     );
   });
 
-  it("上游已自行取消 → 本地收口为 expired（同样不退钱）", async () => {
+  it("上游已自行取消 → sweep 不再收口（退款改由 reconcileAbandonedActivations 负责）", async () => {
     mocks.activation.findMany.mockResolvedValue([activationRow({ createdAt: new Date(Date.now() - 17 * 60_000) })]);
     mocks.activation.updateMany.mockResolvedValue({ count: 1 });
     mocks.grizzly.getStatus.mockResolvedValue({ state: "CANCEL" });
 
     const r = await sweepStaleActivations();
 
+    /* 关键：不能把上游已取消的号标成 expired —— 那会吞掉买家的钱。
+       退款口径只保留在 reconciler 一处。 */
     expect(mocks.grizzly.setStatus).not.toHaveBeenCalled();
-    expect(r.recycled).toBe(1);
+    expect(r.recycled).toBe(0);
+    expect(r.scanned).toBe(1);
   });
 
   it("上游仍拒绝取消 → deferred，保持 waiting 下次再试", async () => {
@@ -380,5 +383,79 @@ describe("超时回收：按号龄判定，不依赖定时器与巡检频率", (
     expect(view.autoCancelInSeconds).not.toBeNull();
     expect(view.autoCancelInSeconds).toBeGreaterThan(0);
     expect(view.autoCancelAt).toBeTruthy();
+  });
+});
+
+describe("reconcileAbandonedActivations：弃单核账（资金安全，独立于保底回收开关）", () => {
+  /*
+   * 背景：本地激活状态只靠买家浏览器轮询更新。买家一切走，本地就永远冻在
+   * waiting，而上游早已出码或取消。实测 wa/151 那笔 $0.12 卡了一整天。
+   */
+
+  it("上游已取消 + 过了确认窗口 → 退款给卡密（老板定的口径）", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      activationRow({ createdAt: new Date(Date.now() - 30 * 60_000), costUsd: "0.12" }),
+    ]);
+    mocks.activation.findUnique.mockResolvedValue(activationRow({ costUsd: "0.12" }));
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "CANCEL" });
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.refunded).toBe(1);
+    expect(r.refundedUsd).toBe("0.12");
+  });
+
+  it("上游已取消但还在确认窗口内 → 不退款（上游可能只是暂时可取消态）", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      /* 刚取号 1 分钟，实测可取消窗口 64s~334s 浮动，此时退款有风险 */
+      activationRow({ createdAt: new Date(Date.now() - 1 * 60_000) }),
+    ]);
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "CANCEL" });
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.refunded).toBe(0);
+    expect(r.skipped).toBe(1);
+  });
+
+  it("上游其实已出码 → 补记，绝不让买家的码丢掉", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      activationRow({ createdAt: new Date(Date.now() - 30 * 60_000) }),
+    ]);
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "OK", code: "984183" });
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.completed).toBe(1);
+    const call = mocks.activation.updateMany.mock.calls.at(-1)![0] as {
+      where: { status: string };
+      data: { status: string; code: string };
+    };
+    /* 条件 UPDATE：只有仍是 waiting 才能认领，防止与买家轮询抢同一单 */
+    expect(call.where.status).toBe("waiting");
+    expect(call.data.status).toBe("ok");
+    expect(call.data.code).toBe("984183");
+  });
+
+  it("上游仍等待中 → 不动它，留给买家轮询与保底回收", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow()]);
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "WAIT_CODE" });
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.refunded).toBe(0);
+    expect(r.completed).toBe(0);
+    expect(mocks.activation.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("没有 waiting 记录 → 直接返回，不打上游", async () => {
+    mocks.activation.findMany.mockResolvedValue([]);
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.scanned).toBe(0);
+    expect(mocks.grizzly.getStatus).not.toHaveBeenCalled();
   });
 });
