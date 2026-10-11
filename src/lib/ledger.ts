@@ -22,6 +22,7 @@ export type LedgerReason =
   | "adjust_reserve"
   | "cancel_refund"
   | "manual"
+  | "topup"
   | "expire";
 
 export const LEDGER_REASONS: readonly LedgerReason[] = [
@@ -30,6 +31,7 @@ export const LEDGER_REASONS: readonly LedgerReason[] = [
   "adjust_reserve",
   "cancel_refund",
   "manual",
+  "topup",
   "expire",
 ];
 
@@ -145,6 +147,16 @@ export class Ledger {
     refId: string | null = null,
   ): Promise<LedgerEntry> {
     return this.creditOrThrow(db, keyId, faceUsd, "reserve", refId);
+  }
+
+  /** 给已有卡密充值（区别于 allocate：allocate 是发新卡时的 0→面值）。 */
+  async topUp(
+    db: LedgerDb | undefined,
+    keyId: string,
+    amountUsd: DecimalInput,
+    refId: string | null = null,
+  ): Promise<LedgerEntry> {
+    return this.creditOrThrow(db, keyId, amountUsd, "topup", refId);
   }
 
   /** 取号上限预扣。 */

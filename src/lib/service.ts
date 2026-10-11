@@ -52,6 +52,72 @@ export function orderName(faceUsd: DecimalInput): string {
   return `Grizzly 卡密 $${dec(faceUsd).toFixed(2)}`;
 }
 
+/**
+ * 给**已有卡密**充值：只创建 pending 订单，钱到账后才加余额（见 fulfillPaidOrder）。
+ *
+ * 与 createPayOrder 的关系：孪生，但不是同一件事 ——
+ *   - 新购：付款后**新建**一张卡密
+ *   - 充值：付款后给**已存在**的卡密加余额
+ * 所以订单用 kind 区分，且充值订单不绑 keyId（那个字段是 @unique，一卡一单）。
+ *
+ * 安全：目标卡密必须是**调用方已登录的这张卡**（keyId 由会话得出，不接受前端传 id）。
+ * 否则别人可以把余额充到任意卡上，等于替他买单。
+ */
+export async function createTopupOrder(
+  input: { keyId: string; amountUsd: DecimalInput },
+  options: { ldc?: LdcClient } = {},
+): Promise<CreatePayOrderResult> {
+  const config = getConfig();
+
+  const check = checkFaceAmount(input.amountUsd);
+  if (!check.ok) throw badRequest(check.reason ?? "金额不合法");
+  const amountUsd = check.value;
+
+  const prisma = getPrisma();
+  const key = await prisma.cardKey.findUnique({ where: { id: input.keyId } });
+  if (!key) throw notFound("卡密不存在");
+  if (key.status !== "active") throw conflict(ERROR_CODES.CONFLICT, "该卡密当前不可充值");
+
+  const settings = await getSiteSettings();
+  const amountLdc = usdToLdc(amountUsd, settings.rateLdcPerUsd, settings.markupPct);
+  const outTradeNo = generateOutTradeNo();
+  const name = `卡密充值 ${amountUsd.toFixed(2)}`;
+
+  const order = await prisma.order.create({
+    data: {
+      outTradeNo,
+      name,
+      kind: "topup",
+      amountLdc: toStorageString(amountLdc),
+      faceUsd: toStorageString(amountUsd),
+      status: "pending",
+      gateway: "epay",
+      targetKeyId: key.id,
+    },
+  });
+
+  const ldc = options.ldc ?? getLdcClient();
+  const result = await ldc.createOrder({
+    outTradeNo,
+    name,
+    money: amountLdc,
+    notifyUrl: config.notifyUrl,
+    returnUrl: `${config.NEXT_PUBLIC_APP_URL.replace(/\/+$/, "")}/shop?topup=${outTradeNo}`,
+  });
+
+  if (result.orderNo) {
+    await prisma.order.update({ where: { id: order.id }, data: { ldcTradeNo: result.orderNo } });
+  }
+
+  return {
+    orderId: order.id,
+    outTradeNo,
+    faceUsd: amountUsd.toFixed(2),
+    amountLdc: amountLdc.toFixed(2),
+    payUrl: result.payUrl,
+  };
+}
+
 export async function createPayOrder(
   faceUsdInput: DecimalInput,
   options: { ldc?: LdcClient } = {},

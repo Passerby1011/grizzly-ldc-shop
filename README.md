@@ -121,6 +121,42 @@ git config core.hooksPath .githooks
    | `NEXT_PUBLIC_APP_URL` | 站点对外地址（决定 `notify_url` 与 Cookie 的 Secure 标记） |
    | `CRON_SECRET` | Cron 鉴权口令 |
 
+## 卡密充值（2026-10-11）
+
+已经持有卡密的用户可以直接给**这张卡**充值，不必再买新卡。
+
+| | 新购 | 充值 |
+|---|---|---|
+| 入口 | 首页「选择面值」/ 自定义金额 | 接码台余额卡下方「+ 给这张卡充值」 |
+| 订单 `kind` | `purchase` | `topup` |
+| 付款后 | **新建**一张卡密 | 给**已有**卡加余额 |
+| 卡密明文 | 有（只展示一次） | 无（本来就知道） |
+| `Order.keyId` | 绑定新卡 | 空（该字段 @unique，一卡一单） |
+| `Order.targetKeyId` | 空 | 指向被充值的卡 |
+
+**资金安全要点**：
+
+- 目标卡密**只来自服务端会话**（`requireSession`），接口 body 里没有 `keyId` ——
+  否则任何人可以把余额充到别人卡上，等于替他人买单。
+- 幂等双保险：订单状态条件 UPDATE（pending→paid）+ 查该订单是否已产生 `topup` 流水。
+  后者更稳 —— 即使订单被人工改回 pending 重发，也不会重复加钱。
+- 池占用**自动跟着涨**：`getAllocatedUsd` 是 `sum(CardKey.balanceUsd)`，
+  所以加余额即等于增加已分配额，无需额外写 `PoolReservation`。
+- 给已作废/已耗尽的卡充值会自动恢复为 `active` 并重新占用池。
+- 金额规则与买卡共用 `checkFaceAmount`（最小 0.01，必须是 0.01 整数倍），
+  报价也共用 `/api/pay/quote`，避免两条路径价格漂移。
+
+## 首页「可售余额」
+
+买家据此判断还能不能买、能买多少。数据来自 `GET /api/site/stock`。
+
+**刻意只暴露必要数字**：`availableUsd`（可售余额 = 上游真实余额 − 已售预留 − 安全缓冲）、
+`maxFaceUsd`、`affordablePresets`。**绝不返回**上游真实余额、已分配额、安全缓冲
+等内部数字 —— 那些属于经营信息，只有带鉴权的后台 `/api/admin/overview` 才有。
+
+上游读不到时返回 `degraded: true` 且**不给数字**（前端显示「暂时查不到」），
+避免用假数据误导下单。前端 30 秒刷新一次。
+
 ## 两条「不要动」的约定（2026-10-10 老板确认）
 
 以下两条是**老板手动设定的业务决定**，不是 bug，不要"顺手修好"：

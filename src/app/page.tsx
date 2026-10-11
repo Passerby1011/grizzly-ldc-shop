@@ -4,6 +4,7 @@ import { effectiveLdcRate, usdToLdc } from "@/lib/money";
 import { getSiteSettings } from "@/lib/settings";
 import { BuyButton } from "./_components/BuyButton";
 import { CustomAmountBuy } from "./_components/CustomAmountBuy";
+import { StockBanner } from "./_components/StockBanner";
 
 export const dynamic = "force-dynamic";
 
@@ -78,6 +79,11 @@ export default async function HomePage() {
             </p>
           </div>
         </div>
+      </section>
+
+      {/* 可售余额：买家据此判断还能不能买、能买多少 */}
+      <section>
+        <StockBanner />
       </section>
 
       {/* 面值档位 */}

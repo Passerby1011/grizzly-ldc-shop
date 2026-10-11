@@ -25,10 +25,21 @@ model Order {
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
 
+  /// purchase = 新购卡密；topup = 给已有卡密充值
+  kind String @default("purchase")
+
   keyId String?   @unique
   key   CardKey?  @relation(fields: [keyId], references: [id])
 
+  /**
+   * 充值订单指向的目标卡密（不设 unique：同一张卡可以反复充值）。
+   * 新购订单此字段为空；用 kind 区分，避免和 keyId 的 unique 约束冲突。
+   */
+  targetKeyId String?
+  targetKey   CardKey? @relation("TopupTarget", fields: [targetKeyId], references: [id])
+
   @@index([status, createdAt])
+  @@index([targetKeyId, status])
 }
 
 /// 卡密：面值美元，余额被站点账本"预留锁定"
@@ -46,6 +57,9 @@ model CardKey {
   order       Order?
   ledger      KeyLedger[]
   activations Activation[]
+
+  /// 这张卡被充值过多少次（Order.targetKeyId 的反向关系）
+  topups Order[] @relation("TopupTarget")
 
   @@index([status, createdAt])
 }

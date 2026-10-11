@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { displayCountryName, displayServiceName, hasChineseName } from "@/lib/service-names.zh";
 import { SearchablePicker } from "./_components/SearchablePicker";
+import { TopupPanel } from "./_components/TopupPanel";
 import { ApiCallError, apiGet, apiPost, errorMessage } from "./_api";
 import type {
   ActivationView,
@@ -479,6 +480,9 @@ export default function ShopPage() {
                 {busy === "me" ? "刷新中…" : "刷新余额"}
               </button>
             </div>
+
+            {/* 充值：只能充当前这张卡（目标由服务端会话决定） */}
+            <TopupPanel balanceUsd={session.balanceUsd} onDone={refreshMe} />
           </section>
 
           <section className="card space-y-5">

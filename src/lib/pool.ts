@@ -242,7 +242,87 @@ export async function fulfillPaidOrder(input: {
       },
     });
 
-    if (claimed.count === 0 || order.keyId) {
+    /*
+     * 幂等闸门：只有从 pending 成功改成 paid 的那一次才发货。
+     *
+     * 两种 kind 各自的「已发过」判据不同：
+     *   purchase —— 看订单有没有绑卡（keyId 非空即已建过卡）
+     *   topup    —— 看这张卡有没有收到过这笔订单的入账流水
+     * 单看 claimed.count 不够：重复通知时它必然是 0，会直接落到 alreadyPaid。
+     */
+    if (claimed.count === 0) {
+      return {
+        alreadyPaid: true,
+        keyId: order.keyId ?? order.targetKeyId,
+        code: null as string | null,
+        faceUsd: order.faceUsd.toString(),
+        amountLdc: order.amountLdc.toString(),
+      };
+    }
+
+    /* ---- 充值：给已有卡密加余额，不建新卡 ---- */
+    if (order.kind === "topup") {
+      if (!order.targetKeyId) {
+        throw new Error(`充值订单缺少目标卡密: ${orderId}`);
+      }
+      const target = await tx.cardKey.findUnique({ where: { id: order.targetKeyId } });
+      if (!target) throw new Error(`充值目标卡密不存在: ${order.targetKeyId}`);
+
+      /*
+       * 二次幂等：以「本订单是否已产生 topup 流水」为准。
+       * 比只依赖 claimed.count 更稳 —— 即使订单状态被人工改回 pending 重发，
+       * 也不会重复加钱。
+       */
+      const dup = await tx.keyLedger.findFirst({
+        where: { refId: orderId, reason: "topup" },
+        select: { id: true },
+      });
+      if (dup) {
+        return {
+          alreadyPaid: true,
+          keyId: target.id,
+          code: null as string | null,
+          faceUsd: order.faceUsd.toString(),
+          amountLdc: order.amountLdc.toString(),
+        };
+      }
+
+      /* 加余额 —— getAllocatedUsd 是 sum(balanceUsd)，池占用会自动跟着涨 */
+      await ledger.topUp(tx, target.id, order.faceUsd.toString(), orderId);
+
+      /* 已作废/已耗尽的卡被充值后应回到可用状态 */
+      if (target.status !== "active") {
+        await tx.cardKey.update({ where: { id: target.id }, data: { status: "active" } });
+        await tx.poolReservation.updateMany({
+          where: { keyId: target.id },
+          data: { released: false, releasedAt: null },
+        });
+      }
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          rawNotify: toJsonInput({
+            trace: input.trace ?? "notify",
+            notify: input.notify ?? null,
+            topup: true,
+            targetPrefix: target.codePrefix,
+            at: new Date().toISOString(),
+          }),
+        },
+      });
+
+      return {
+        alreadyPaid: false,
+        keyId: target.id,
+        code: null as string | null,
+        faceUsd: order.faceUsd.toString(),
+        amountLdc: order.amountLdc.toString(),
+      };
+    }
+
+    /* ---- 新购：原有逻辑，但补上 keyId 已存在的幂等判断 ---- */
+    if (order.keyId) {
       return {
         alreadyPaid: true,
         keyId: order.keyId,
