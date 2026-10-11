@@ -12,6 +12,7 @@ import { getLedger } from "./ledger";
 import { getGrizzlyClient, type GrizzlyClient } from "./grizzly";
 import { codePrefix, generateCode, hashCode } from "./keycodec";
 import { tryGetConfig } from "./config";
+import { getSiteSettings } from "./settings";
 
 export const DEFAULT_SAFETY_BUFFER_USD = "0.50";
 export const MAX_KEYS_PER_BATCH = 50;
@@ -78,10 +79,26 @@ export function clampNonNegative(value: DecimalInput): Decimal {
   return amount.isNegative() ? dec(0) : amount;
 }
 
-export function resolveSafetyBufferUsd(override?: DecimalInput): Decimal {
+/**
+ * 安全缓冲的**异步**解析：DB 设置 > 环境变量 > 默认。
+ *
+ * 曾经这里是同步函数，只读环境变量 —— 于是后台把「安全缓冲」从 0.50 改成 0.20
+ * 之后，设置接口读回是 0.20（因为那是另一条读设置的路径），
+ * 但池计算、概览、可用余额全都还在用 0.50。老板改了没生效。
+ *
+ * 现在统一走 getSiteSettings()，与汇率/锁定时长同一个来源。
+ * 注意：设置层有 30 秒进程内缓存，改完最多 30 秒后生效。
+ */
+export async function resolveSafetyBufferUsd(override?: DecimalInput): Promise<Decimal> {
   if (override !== undefined) return dec(override);
-  const config = tryGetConfig();
-  return dec(config?.SAFETY_BUFFER_USD ?? DEFAULT_SAFETY_BUFFER_USD);
+  try {
+    const settings = await getSiteSettings();
+    return dec(settings.safetyBufferUsd);
+  } catch {
+    /* 设置层不可用（比如配置不全）时退回环境变量，保证池计算不挂 */
+    const config = tryGetConfig();
+    return dec(config?.SAFETY_BUFFER_USD ?? DEFAULT_SAFETY_BUFFER_USD);
+  }
 }
 
 /** 已售未消耗：所有 active 卡密的余额之和。 */
@@ -138,7 +155,7 @@ export async function getPoolState(options: PoolStateOptions = {}): Promise<Pool
     getRealBalance({ client: options.client, prisma }),
     getAllocatedUsd(prisma),
   ]);
-  const buffer = resolveSafetyBufferUsd(options.safetyBufferUsd);
+  const buffer = await resolveSafetyBufferUsd(options.safetyBufferUsd);
   return {
     realBalanceUsd: real.usd,
     allocatedUsd: allocated,
