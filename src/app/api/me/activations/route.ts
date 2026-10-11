@@ -1,6 +1,7 @@
 import { jsonOk, requireSession, withRoute } from "@/lib/http";
 import { getPrisma } from "@/lib/db";
 import { dec } from "@/lib/money";
+import { isKeyUsable } from "@/lib/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +26,8 @@ export const GET = withRoute(async (request: Request) => {
           balanceUsd: dec(key.balanceUsd.toString()).toFixed(2),
           status: key.status,
           expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null,
+          /* 卡密是否还能用：前端据此决定"恢复进行中的取号"是否安全 */
+          usable: isKeyUsable(key),
         }
       : null,
     activations: activations.map((item) => ({

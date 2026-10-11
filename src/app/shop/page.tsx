@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { displayCountryName, displayServiceName, hasChineseName } from "@/lib/service-names.zh";
 import { SearchablePicker } from "./_components/SearchablePicker";
 import { TopupPanel } from "./_components/TopupPanel";
+import { UsageHistory } from "./_components/UsageHistory";
 import { ApiCallError, apiGet, apiPost, errorMessage } from "./_api";
 import type {
   ActivationView,
@@ -24,6 +25,12 @@ const POLL_INTERVAL_MS = 4000;
  * 这些 ID 来自上游 getCountries 实测（美国 187、英国 16、中国 3…）。
  */
 const PINNED_COUNTRY_IDS = [187, 16, 3, 182, 45, 43, 78, 22, 6, 10, 4, 7, 52, 73, 14, 55];
+
+/**
+ * 正在进行的激活存这里，刷新页面后能接着轮询。
+ * 只存 id（够恢复用），真正的权威状态始终在服务端 / 上游。
+ */
+const ACTIVE_KEY_STORAGE = "glc.activeActivation";
 
 /** 国家 + 服务都选好后，自动估价的防抖等待。 */
 const QUOTE_DEBOUNCE_MS = 400;
@@ -69,6 +76,8 @@ export default function ShopPage() {
 
   const [activation, setActivation] = useState<ActivationView | null>(null);
   const [poll, setPoll] = useState<PollView | null>(null);
+  const [me, setMe] = useState<MeView | null>(null);
+  const [booting, setBooting] = useState(true);
   /** 取消倒计时剩余秒数；null = 还没拿到服务端数据（按锁定处理）。 */
   const [cancelLeft, setCancelLeft] = useState<number | null>(null);
   /** 本轮倒计时的起始总秒数，用于算进度条百分比。 */
@@ -104,10 +113,74 @@ export default function ShopPage() {
       setSession(view);
       setCodeInput("");
       setNotice(`已进入接码台：${view.maskedCode}，余额 ${view.balanceUsd} USD`);
+      /* 立刻拉一次使用历史，别让"使用历史"区块停在"加载中…" */
+      try {
+        setMe(await apiGet<MeView>("/api/me/activations"));
+      } catch {
+        /* 历史拉取失败不影响接码主流程 */
+      }
       return view;
     },
     [],
   );
+
+  /*
+   * 【刷新存活】挂载时用 HttpOnly Cookie 里的会话签名恢复登录态。
+   *
+   * 以前一刷新就"全没了"：页面状态只活在 React 内存里，Cookie 明明还在
+   * 也没人去读。现在：
+   *   ① 调 /api/me/activations → 拿到卡密信息 + 取号历史 + 流水
+   *   ② 从 localStorage 取回"正在进行的激活 id"，继续轮询等码
+   * 恢复失败不影响使用，就当没登录，走正常贴卡密流程。
+   */
+  useEffect(() => {
+    void (async () => {
+      try {
+        const view = await apiGet<MeView>("/api/me/activations");
+        setMe(view);
+        if (view.key) {
+          setSession({
+            keyId: view.key.id,
+            maskedCode: view.key.codePrefix
+              ? `${view.key.codePrefix}-${"*".repeat(4)}`
+              : "GS-****",
+            codePrefix: view.key.codePrefix,
+            balanceUsd: view.key.balanceUsd,
+            faceUsd: view.key.faceUsd,
+            status: view.key.status,
+            expiresAt: view.key.expiresAt,
+          });
+
+          /* 恢复进行中的激活：让轮询接着跑，不用重新取号 */
+          const stored = window.localStorage.getItem(ACTIVE_KEY_STORAGE);
+          if (stored) {
+            const rows = view.activations ?? [];
+            const hit = rows.find((a) => a.id === stored);
+            if (hit && hit.status === "waiting" && view.key.usable !== false) {
+              setActivation({
+                activationId: hit.id,
+                phone: hit.phone,
+                service: hit.service,
+                country: hit.country,
+                reservedUsd: hit.reservedUsd,
+                costUsd: hit.costUsd ?? hit.reservedUsd,
+                priceSource: "restored",
+                balanceUsd: view.key.balanceUsd,
+              });
+              setNotice("已恢复上次进行中的取号，继续等待验证码…");
+            } else {
+              /* 已经结束了（收到码/取消/回收）→ 清掉，别留脏标记 */
+              window.localStorage.removeItem(ACTIVE_KEY_STORAGE);
+            }
+          }
+        }
+      } catch {
+        /* 恢复失败不打扰用户：当作未登录 */
+      } finally {
+        setBooting(false);
+      }
+    })();
+  }, []);
 
   /* 支付回跳：?order=xxx → 主动查单补发卡密 */
   useEffect(() => {
@@ -161,6 +234,18 @@ export default function ShopPage() {
   }, []);
 
   /* 轮询激活状态：只在 waiting 时跑 */
+  /* 激活结束（收到码 / 取消 / 回收）→ 清掉持久化标记，刷新后不再试图恢复 */
+  useEffect(() => {
+    if (!poll) return;
+    if (poll.status === "ok" || poll.status === "cancelled" || poll.status === "expired") {
+      try {
+        window.localStorage.removeItem(ACTIVE_KEY_STORAGE);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [poll?.status]);
+
   useEffect(() => {
     if (!activation || poll?.status === "ok" || poll?.status === "cancelled") return;
     let stopped = false;
@@ -267,15 +352,19 @@ export default function ShopPage() {
   }, [services, serviceFilter]);
 
   const refreshMe = useCallback(async () => {
-    const me = await apiGet<MeView>("/api/me/activations");
-    if (me.key) {
+    const view = await apiGet<MeView>("/api/me/activations");
+    setMe(view);
+    if (view.key) {
       setSession((prev) =>
         prev
-          ? { ...prev, balanceUsd: me.key?.balanceUsd ?? prev.balanceUsd, status: me.key?.status ?? prev.status }
+          ? { ...prev, balanceUsd: view.key?.balanceUsd ?? prev.balanceUsd, status: view.key?.status ?? prev.status }
           : prev,
       );
+    } else {
+      /* 会话已失效（过期/被换） —— 退回登录态，别让界面继续假装已登录 */
+      setSession(null);
     }
-    setNotice(`余额已刷新：${me.key?.balanceUsd ?? "0.00"} USD`);
+    setNotice(`余额已刷新：${view.key?.balanceUsd ?? "0.00"} USD`);
   }, []);
 
   const quotePrice = useCallback(async () => {
@@ -314,6 +403,12 @@ export default function ShopPage() {
     });
     setActivation(view);
     setPoll(null);
+    /* 记住它，刷新后还能接着等码 */
+    try {
+      window.localStorage.setItem(ACTIVE_KEY_STORAGE, view.activationId);
+    } catch {
+      /* 隐私模式下 localStorage 可能不可用，忽略 */
+    }
     setCancelLeft(null);
     setCancelTotal(null);
     setNotice(`已取号 ${view.phone}，预扣 ${view.reservedUsd} USD，实际成本 ${view.costUsd} USD`);
@@ -732,6 +827,11 @@ export default function ShopPage() {
             </div>
           ) : null}
         </section>
+      ) : null}
+
+      {/* 使用历史：取号记录 + 资金流水，刷新不丢（数据来自服务端会话） */}
+      {session ? (
+        <UsageHistory me={me} onRefresh={() => void run("me", refreshMe)} />
       ) : null}
 
       {notice ? (

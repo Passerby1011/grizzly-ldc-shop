@@ -81,15 +81,31 @@ export interface MeView {
     faceUsd: string;
     balanceUsd: string;
     status: string;
+    expiresAt: string | null;
+    /** 是否仍可用（过期/作废的卡不能再取号） */
+    usable?: boolean;
   } | null;
+  /** 该卡密的取号历史（倒序）。刷新页面后靠它恢复"我用过什么"。 */
   activations: Array<{
     id: string;
+    grizzlyId: string;
     service: string;
     country: string;
     phone: string;
     status: string;
     code: string | null;
+    reservedUsd: string;
     costUsd: string | null;
+    createdAt: string;
+    closedAt: string | null;
+  }>;
+  /** 资金流水（倒序）：买卡/充值/取号/退款一目了然。 */
+  ledger: Array<{
+    id: string;
+    deltaUsd: string;
+    balanceAfter: string;
+    reason: string;
+    refId: string | null;
     createdAt: string;
   }>;
 }
