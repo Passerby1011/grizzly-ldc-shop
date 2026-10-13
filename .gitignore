@@ -22,3 +22,6 @@ Thumbs.db
 *.log
 /tmp/
 .cache/
+
+# 探针运行时残留（含真实上游激活 ID，绝不入库）
+.probe-pending.json

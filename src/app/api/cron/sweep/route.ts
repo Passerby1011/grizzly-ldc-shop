@@ -1,6 +1,11 @@
 import { jsonOk, requireBearer, withRoute } from "@/lib/http";
 import { getConfig } from "@/lib/config";
-import { auditUnrefundedActivations, reconcileAbandonedActivations, sweepStaleActivations } from "@/lib/service";
+import {
+  auditUnrefundedActivations,
+  purgeExpiredCodes,
+  reconcileAbandonedActivations,
+  sweepStaleActivations,
+} from "@/lib/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,9 +36,12 @@ export const GET = withRoute(async (request: Request) => {
    * 审计放在核账**之后**：先让核账把能自动退的都退掉，
    * 再审计剩下的 —— 剩下的才是真正需要人看的。
    */
+  /* 明文清理：过 24 小时展示窗口即物理抹除，不依赖是否有人查单 */
+  const purged = await purgeExpiredCodes();
+
   const audit = await auditUnrefundedActivations();
   if (audit.suspicious.length > 0) {
     console.warn("[audit] 发现未退款激活", JSON.stringify(audit).slice(0, 800));
   }
-  return jsonOk({ ...result, abandoned, audit, ranAt: new Date().toISOString() });
+  return jsonOk({ ...result, abandoned, purged, audit, ranAt: new Date().toISOString() });
 });

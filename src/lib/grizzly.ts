@@ -583,7 +583,31 @@ const AVAILABILITY_TTL_MS = 60 * 1000;
 
 const countriesCache = new TtlCache(CATALOG_TTL_MS, () => getGrizzlyClient().getCountries());
 const servicesCache = new TtlCache(CATALOG_TTL_MS, () => getGrizzlyClient().getServicesList());
-const availabilityCache = new Map<string, TtlCache<GrizzlyAvailabilityItem[]>>();
+/*
+ * 可用号缓存。键是用户传入的 country 字符串，因此必须设上限：
+ * 曾经它是个永不清理的 Map，每个新的 country 串都会新增一条 TtlCache
+ * （并触发一次上游请求）—— 攻击者用 GET /api/catalog/availability?country=<随机>
+ * 反复打就能把函数实例内存撑到 OOM，同时把上游配额打满。
+ *
+ * 这里做两件事：
+ *   ① 条数上限（超出淘汰最旧的键）
+ *   ② 超过 TTL 的条目在写入时顺手清掉，避免只增不减
+ */
+const AVAILABILITY_CACHE_MAX = 64;
+const availabilityCache = new Map<string, { cache: TtlCache<GrizzlyAvailabilityItem[]>; at: number }>();
+
+/** 清掉过期条目，并在超上限时淘汰最旧的键。 */
+function pruneAvailabilityCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of availabilityCache) {
+    if (now - entry.at > AVAILABILITY_TTL_MS) availabilityCache.delete(key);
+  }
+  while (availabilityCache.size > AVAILABILITY_CACHE_MAX) {
+    const oldest = availabilityCache.keys().next().value;
+    if (oldest === undefined) break;
+    availabilityCache.delete(oldest);
+  }
+}
 
 export function getCountriesCached(): Promise<GrizzlyCountry[]> {
   return countriesCache.get();
@@ -594,10 +618,16 @@ export function getServicesCached(): Promise<GrizzlyService[]> {
 }
 
 export function getNumbersStatusCached(country: string): Promise<GrizzlyAvailabilityItem[]> {
-  let cache = availabilityCache.get(country);
-  if (!cache) {
-    cache = new TtlCache(AVAILABILITY_TTL_MS, () => getGrizzlyClient().getNumbersStatus(country));
-    availabilityCache.set(country, cache);
+  let entry = availabilityCache.get(country);
+  if (!entry) {
+    pruneAvailabilityCache();
+    entry = {
+      cache: new TtlCache(AVAILABILITY_TTL_MS, () => getGrizzlyClient().getNumbersStatus(country)),
+      at: Date.now(),
+    };
+    availabilityCache.set(country, entry);
+  } else {
+    entry.at = Date.now();
   }
-  return cache.get();
+  return entry.cache.get();
 }

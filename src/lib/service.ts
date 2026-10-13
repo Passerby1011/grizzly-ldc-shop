@@ -78,6 +78,16 @@ export async function createTopupOrder(
   if (!key) throw notFound("卡密不存在");
   if (key.status !== "active") throw conflict(ERROR_CODES.CONFLICT, "该卡密当前不可充值");
 
+  /*
+   * 与新购走同一道池容量闸门。
+   *
+   * 为什么充值也必须拦：充值的钱最终会变成从上游买号的额度，
+   * 所以"卖出超过上游余额的承诺"这件事，充值和新购一样会造成。
+   * 曾经只有新购有闸门，充值可以直接买下池子装不下的额度 ——
+   * 买家付了 LDC，站点欠着兑不出的号，属于负债而非漏洞，但同样要拦。
+   */
+  await checkTopupPoolCapacity(amountUsd);
+
   const settings = await getSiteSettings();
   const amountLdc = usdToLdc(amountUsd, settings.rateLdcPerUsd, settings.markupPct);
   const outTradeNo = generateOutTradeNo();
@@ -267,6 +277,11 @@ export async function startActivation(input: StartActivationInput): Promise<Star
     throw forbidden("卡密不可用（已过期或已失效）");
   }
 
+  /*
+   * priceUsd 覆盖分支只保留给服务端内部调用（管理端/测试）。
+   * 公开 HTTP 路由已不再接受价格入参（见 /api/sms/get），
+   * 且下方 observe 会跳过 override 来源，避免污染全局价格缓存。
+   */
   const quote = input.priceUsd
     ? { service: input.service, country: input.country, priceUsd: dec(input.priceUsd), source: "override" as const }
     : await getPriceProvider().quote(input.service, input.country);
@@ -311,11 +326,22 @@ export async function startActivation(input: StartActivationInput): Promise<Star
   /* 4) 差额退回（cap → cost） */
   const settled = await ledger.settleReservation(undefined, input.keyId, cap, cost, activation.id);
 
-  /* 回填价格缓存（真实成交成本） */
-  try {
-    await getPriceProvider().observe(input.service, input.country, cost);
-  } catch {
-    // 缓存回填失败不影响取号
+  /*
+   * 回填价格缓存。
+   *
+   * 只在**服务端自己估价**时才回填：override 分支的价格来自调用方
+   * （历史上就是被滥用的那条路），绝不能写进全局共享的 PriceCache，
+   * 否则一个人的取号会改写所有人的售价。
+   *
+   * 注：这个数本质是"估价"而非上游真实成交成本（上游不返回成交价），
+   * 所以它只是让下次报价更接近，不参与任何资金结算。
+   */
+  if (quote.source !== "override") {
+    try {
+      await getPriceProvider().observe(input.service, input.country, cost);
+    } catch {
+      // 缓存回填失败不影响取号
+    }
   }
 
   return {
@@ -380,7 +406,15 @@ export async function pollActivation(input: {
   if (!activation || activation.keyId !== input.keyId) throw notFound("激活记录不存在");
 
   /* 超时回收阈值：每次都现取（有 30s 缓存），后台改了立刻反映到倒计时 */
-  const autoCancelMinutes = (await getSiteSettings()).autoCancelMinutes;
+  const pollSettings = await getSiteSettings();
+  const autoCancelMinutes = pollSettings.autoCancelMinutes;
+  /*
+   * 取消锁定时长同样走设置（DB > env > 默认）。
+   * 曾经这里只读环境变量，后台改了不生效 —— 见 cancelWindow 的说明。
+   */
+  const lockSeconds = Number.isFinite(pollSettings.cancelLockSeconds)
+    ? pollSettings.cancelLockSeconds
+    : getConfig().CANCEL_LOCK_SECONDS;
 
   /*
    * 精确回收：买家在等码时会每 4 秒轮询一次，所以**每次轮询都按号龄判一次**。
@@ -398,14 +432,14 @@ export async function pollActivation(input: {
   ) {
     await recycleOneActivation(activation.id);
     const after = await prisma.activation.findUnique({ where: { id: activation.id } });
-    if (after) return toPollResult(after, "等待超时，号码已自动回收", autoCancelMinutes);
+    if (after) return toPollResult(after, "等待超时，号码已自动回收", autoCancelMinutes, lockSeconds);
   }
 
   if (activation.status === "ok") {
-    return toPollResult(activation, null, autoCancelMinutes);
+    return toPollResult(activation, null, autoCancelMinutes, lockSeconds);
   }
   if (activation.status === "cancelled" || activation.status === "expired") {
-    return toPollResult(activation, null, autoCancelMinutes);
+    return toPollResult(activation, null, autoCancelMinutes, lockSeconds);
   }
 
   const parsed: ParsedStatus = await grizzly.getStatus(activation.grizzlyId);
@@ -433,11 +467,7 @@ export async function pollActivation(input: {
       });
       if (claimed.count === 0) {
         const latest = await prisma.activation.findUnique({ where: { id: activation.id } });
-        return toPollResult(
-          latest ?? activation,
-          "该号码已取消/回收，不再下发验证码（费用按规则不退，请联系卖家）",
-          autoCancelMinutes,
-      );
+        return toPollResult(latest ?? activation, "该号码已取消/回收，不再下发验证码（费用按规则不退，请联系卖家）", autoCancelMinutes, lockSeconds);
       }
       /* 认领成功后才通知上游完成（正式扣费）。失败不回滚：码已经给用户了。 */
       try {
@@ -450,22 +480,22 @@ export async function pollActivation(input: {
         where: { id: activation.id },
         data: { smsText },
       });
-      return toPollResult(updated, null, autoCancelMinutes);
+      return toPollResult(updated, null, autoCancelMinutes, lockSeconds);
     }
     case "CANCEL": {
       /* 上游取消 → 等价于取消回补 */
       const refund = await cancelActivationInternal(activation.id, "upstream");
       const latest = await prisma.activation.findUnique({ where: { id: activation.id } });
-      return { ...toPollResult(latest ?? activation, "上游已取消，余额已回补", autoCancelMinutes), balanceUsd: refund.balanceUsd };
+      return { ...toPollResult(latest ?? activation, "上游已取消，余额已回补", autoCancelMinutes, lockSeconds), balanceUsd: refund.balanceUsd };
     }
     case "WAIT_RETRY":
-      return toPollResult(activation, "等待重发验证码", autoCancelMinutes);
+      return toPollResult(activation, "等待重发验证码", autoCancelMinutes, lockSeconds);
     case "WAIT_RESEND":
-      return toPollResult(activation, "已请求重发", autoCancelMinutes);
+      return toPollResult(activation, "已请求重发", autoCancelMinutes, lockSeconds);
     case "WAIT_CODE":
-      return toPollResult(activation, null, autoCancelMinutes);
+      return toPollResult(activation, null, autoCancelMinutes, lockSeconds);
     default:
-      return toPollResult(activation, "上游返回未知状态", autoCancelMinutes);
+      return toPollResult(activation, "上游返回未知状态", autoCancelMinutes, lockSeconds);
   }
 }
 
@@ -500,9 +530,10 @@ function toPollResult(
   },
   hint: string | null,
   autoCancelMinutes = 0,
+  cancelLockSeconds?: number,
 ): PollActivationResult {
   const cost = activation.costUsd ?? activation.reservedUsd;
-  const window = cancelWindow(activation.createdAt, activation.cancelRetryAt ?? null);
+  const window = cancelWindow(activation.createdAt, activation.cancelRetryAt ?? null, cancelLockSeconds);
   const auto = autoCancelWindow(activation.createdAt, autoCancelMinutes);
   return {
     activationId: activation.id,
@@ -554,8 +585,20 @@ function autoCancelWindow(
 function cancelWindow(
   createdAt: Date,
   cancelRetryAt: Date | null = null,
+  cancelLockSeconds: number = getConfig().CANCEL_LOCK_SECONDS,
 ): { cancelAvailableInSeconds: number; cancelLockedUntil: string; cancelRetryLocked: boolean } {
-  const initialMs = createdAt.getTime() + getConfig().CANCEL_LOCK_SECONDS * 1000;
+  /*
+   * 锁定时长优先取后台设置（DB > 环境变量 > 默认）。
+   *
+   * 这里曾经直接读 getConfig()（纯环境变量），导致后台把「取消锁定」
+   * 从 90 改成别的值后界面显示新值、实际仍按 90 秒执行 ——
+   * 与 safetyBufferUsd 之前那个"改了不生效"是同一类病。
+   * 调用方在 pollActivation 里已经 await 了 getSiteSettings()，顺手传进来。
+   */
+  const lockSeconds = Number.isFinite(cancelLockSeconds)
+    ? cancelLockSeconds
+    : getConfig().CANCEL_LOCK_SECONDS;
+  const initialMs = createdAt.getTime() + lockSeconds * 1000;
   const retryMs = cancelRetryAt ? cancelRetryAt.getTime() : 0;
   const lockUntilMs = Math.max(initialMs, retryMs);
   const now = Date.now();
@@ -600,7 +643,10 @@ export async function cancelActivation(input: {
 
   /* 本地闸门：初始锁 或 上次失败的重试锁 未到期 → 直接拒绝，不打扰上游。 */
   const settings = await getSiteSettings();
-  const lockSeconds = getConfig().CANCEL_LOCK_SECONDS;
+  /* 取后台设置（DB > env > 默认），不是只读环境变量 */
+  const lockSeconds = Number.isFinite(settings.cancelLockSeconds)
+    ? settings.cancelLockSeconds
+    : getConfig().CANCEL_LOCK_SECONDS;
   const initialMs = activation.createdAt.getTime() + lockSeconds * 1000;
   const retryMs = activation.cancelRetryAt ? activation.cancelRetryAt.getTime() : 0;
   const lockUntil = Math.max(initialMs, retryMs);
@@ -853,6 +899,20 @@ const DEFAULT_CONFIRM_CANCEL_MINUTES = 6;
 const DEFAULT_CANCEL_RETRY_SECONDS = 150;
 
 /**
+ * 充值前的池容量校验。
+ *
+ * 复用 pool.ts 的 assertPoolCapacity（不足时抛 PoolExhaustedError，
+ * 路由层统一映射成 409 + 可读中文）。
+ *
+ * 用动态 import 而不是顶层 import：pool.ts 已经 import 了本文件的
+ * getSiteSettings 等，顶层互相 import 会形成循环依赖。
+ */
+async function checkTopupPoolCapacity(amountUsd: DecimalInput): Promise<void> {
+  const { assertPoolCapacity } = await import("./pool");
+  await assertPoolCapacity(amountUsd);
+}
+
+/**
  * 机会式巡检：被轮询接口调用，同一实例最多每 60 秒真跑一次，失败静默。
  * 纯兜底，真正的频率保证靠 /api/cron/sweep 由外部定时器打。
  */
@@ -937,7 +997,7 @@ async function recycleOneActivation(activationId: string): Promise<"recycled" | 
    * 上游已取消 → **不在这里处理，交给 reconcileAbandonedActivations 退款**。
    *
    * 为什么跳过而不是像以前那样标 expired：上游取消意味着号不可能再出码，
-   * 钱也已被上游退回主账号，此时应当把卡密余额退回买家（老板 2026-10-11 定）。
+   * 钱也已被上游退回主账号，此时应当把卡密余额退回买家（既定口径）。
    * 退款口径只保留在 reconciler 一处，避免两条路径给出不同结果。
    */
   if (state.state === "CANCEL") return "skipped";
@@ -995,9 +1055,17 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
   const prisma = getPrisma();
   const result = { scanned: 0, completed: 0, refunded: 0, refundedUsd: "0.00", skipped: 0, errors: 0 };
 
+  /*
+   * 按「上次检查时间」升序取，而不是按创建时间。
+   *
+   * 原来按 createdAt asc 取最老的 limit 条：只要最老那批一直解析不了
+   * （上游持续返回 WAIT、或网络错误），每轮都重复扫它们，
+   * 比它们新的弃单**永远轮不到** —— 资金永久卡住且无人发现。
+   * 改成最久没被检查过的优先，天然公平轮转。
+   */
   const waiting = await prisma.activation.findMany({
     where: { status: "waiting" },
-    orderBy: { createdAt: "asc" },
+    orderBy: [{ lastPolledAt: { sort: "asc", nulls: "first" } }, { createdAt: "asc" }],
     take: limit,
   });
   if (!waiting.length) return result;
@@ -1009,6 +1077,11 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
   let refundedTotal = dec(0);
 
   for (const activation of waiting) {
+    /* 先打时间戳：无论这次成功与否，都算"检查过"，避免同一条被反复优先选中 */
+    await prisma.activation
+      .updateMany({ where: { id: activation.id, status: "waiting" }, data: { lastPolledAt: new Date() } })
+      .catch(() => undefined);
+
     let state: ParsedStatus;
     try {
       state = await grizzly.getStatus(activation.grizzlyId);
@@ -1039,7 +1112,7 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
       continue;
     }
 
-    /* 上游已取消 → 过了安全窗口就把钱退回卡密（老板 2026-10-11 定的口径） */
+    /* 上游已取消 → 过了安全窗口就把钱退回卡密（既定口径的口径） */
     if (state.state === "CANCEL") {
       const ageMs = Date.now() - activation.createdAt.getTime();
       if (ageMs < confirmMs) {
@@ -1139,6 +1212,49 @@ export async function auditUnrefundedActivations(graceMinutes = 60): Promise<{
   }
 
   return { graceMinutes, suspicious, totalOwedUsd: totalOwed.toFixed(4) };
+}
+
+/**
+ * 清掉已过 24 小时展示窗口的卡密明文。
+ *
+ * 为什么需要：发新卡时明文会临时写进 Order.rawNotify（供支付回跳页取回一次），
+ * 但原来的清理是**惰性**的 —— 只有有人带着 outTradeNo 调 /api/pay/query
+ * 且已超窗，才会把那一条抹掉。没人查过的订单，明文就一直躺在库里，
+ * 与 README「卡密明文不落库，只存 SHA-256」的承诺不符；任何数据库快照
+ * 都会带上可直接变现的明文。
+ *
+ * 这里做成定期物理清理（由 /api/cron/sweep 每次触发），保证超窗即抹，
+ * 不依赖是否有人访问。
+ */
+export async function purgeExpiredCodes(limit = 200): Promise<{ scanned: number; wiped: number }> {
+  const prisma = getPrisma();
+  const cutoff = new Date(Date.now() - CODE_REVEAL_WINDOW_MS);
+
+  /*
+   * 只取「已付款、落在窗口外、且还没被抹过」的订单。
+   * rawNotify 是 JSON，没法直接按字段查，所以按时间粗筛后在代码里精确判断。
+   */
+  const candidates = await prisma.order.findMany({
+    where: { status: "paid", paidAt: { lt: cutoff } },
+    orderBy: { paidAt: "asc" },
+    take: limit,
+  });
+
+  let wiped = 0;
+  for (const order of candidates) {
+    const stored = extractStoredCode(order.rawNotify);
+    if (!stored.code) continue; /* 没有明文（已抹或本来就没有） */
+    const issuedAt = stored.codeAt ? Date.parse(stored.codeAt) : 0;
+    /* 落款时间缺失也按已超窗处理：宁可早抹，不留明文 */
+    if (Number.isFinite(issuedAt) && issuedAt > 0 && Date.now() - issuedAt <= CODE_REVEAL_WINDOW_MS) {
+      continue;
+    }
+    await wipeStoredCode(order.id, order.rawNotify);
+    wiped += 1;
+  }
+
+  if (wiped > 0) console.log("[purge-codes] 已清理明文", { scanned: candidates.length, wiped });
+  return { scanned: candidates.length, wiped };
 }
 
 export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {

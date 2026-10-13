@@ -74,7 +74,7 @@ export const POST = withRoute(async (request: Request) => {
     const { getLedger } = await import("@/lib/ledger");
     /*
      * 调额度的同时同步面值，否则会出现「面值 $0.01 但余额 $0.20」这种
-     * 自相矛盾的展示（老板 2026-10-13 实测踩到）。
+     * 自相矛盾的展示（实测出现过）。
      *
      * 口径：面值按 manual **净额**同幅变动，保持不变量
      *       面值 = 余额 + 该卡净消耗

@@ -513,7 +513,25 @@ describe("reconcileAbandonedActivations：弃单核账（资金安全，独立�
 
     expect(r.refunded).toBe(0);
     expect(r.completed).toBe(0);
-    expect(mocks.activation.updateMany).not.toHaveBeenCalled();
+    /* 不打状态变更的时间戳也会更新 lastPolledAt（轮转标记），
+       所以这里断言的是「没有改 status」而不是「没调用 updateMany」 */
+    const statusWrites = mocks.activation.updateMany.mock.calls.filter(
+      (c) =>
+        (c[0] as { data?: { status?: string } })?.data?.status !== undefined,
+    );
+    expect(statusWrites).toHaveLength(0);
+  });
+
+  it("公平轮转：每条被检查时都更新 lastPolledAt（避免最老的卡住新的）", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow()]);
+    mocks.grizzly.getStatus.mockResolvedValue({ state: "WAIT_CODE" });
+
+    await reconcileAbandonedActivations();
+
+    const marked = mocks.activation.updateMany.mock.calls.some(
+      (c) => (c[0] as { data?: { lastPolledAt?: unknown } })?.data?.lastPolledAt instanceof Date,
+    );
+    expect(marked).toBe(true);
   });
 
   it("没有 waiting 记录 → 直接返回，不打上游", async () => {

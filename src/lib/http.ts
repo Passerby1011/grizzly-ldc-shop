@@ -152,8 +152,15 @@ export function toErrorResponse(error: unknown): Response {
     return jsonError(ERROR_CODES.BAD_REQUEST, error.message, 400);
   }
   console.error("[api] 未处理异常", error);
-  const message = error instanceof Error ? error.message : "服务器内部错误";
-  return jsonError(ERROR_CODES.INTERNAL, message, 500);
+  /*
+   * 500 一律回固定文案，绝不把 error.message 透给客户端。
+   *
+   * 曾经的写法会把 Prisma 报错原文（含表名、列名、约束名，例如
+   * "The column Order.kind does not exist"）直接返回给匿名调用者 ——
+   * 这等于免费告诉攻击者数据库结构和迁移状态。
+   * 详细信息只留在服务端日志里（上面那行 console.error）。
+   */
+  return jsonError(ERROR_CODES.INTERNAL, "服务器内部错误，请稍后重试", 500);
 }
 
 /** Grizzly 错误码 → 中文可读文案；未映射的码走通用兜底，绝不把 `UNKNOWN` 字面量抛给用户。 */
@@ -279,7 +286,18 @@ function parseCookies(request: Request): Record<string, string> {
     if (index === -1) continue;
     const name = part.slice(0, index).trim();
     const value = part.slice(index + 1).trim();
-    if (name) out[name] = decodeURIComponent(value);
+    if (!name) continue;
+    /*
+     * decodeURIComponent 对畸形输入会抛 URIError（例如 Cookie: glc_key=%）。
+     * 以前没兜底，这个异常会一路冒到 withRoute 变成 500 ——
+     * 本该是"没登录/401"的路径返回了 500 还回显内部异常文案。
+     * 值非法就当这个 cookie 不存在，交给上层按未登录处理。
+     */
+    try {
+      out[name] = decodeURIComponent(value);
+    } catch {
+      /* 忽略这个畸形 cookie，不影响其它 cookie 解析 */
+    }
   }
   return out;
 }
