@@ -447,7 +447,7 @@ npm test
 - 对外可见的缓存（如可用号查询）有**条数上限 + 过期清理**，防止内存与上游配额被滥用。
 - `.env*` 被 `.gitignore` 排除，`scripts/check-secrets.mjs` 做提交前扫描。
 
-漏洞报告请见 [SECURITY.md](./SECURITY.md)。
+漏洞报告请见 [SECURITY.md](./SECURITY.md)；参与开发见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ---
 
