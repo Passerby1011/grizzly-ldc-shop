@@ -1,0 +1,166 @@
+We're changing auto mode to no longer charge for classifier requests in Claude Code. However, this session isn't eligible because your requests go through 127.0.0.1:15721, which isn't compatible with this update. Nothing breaks: auto mode keeps working, and its classifier requests are billed as before. To fix it and access the new version of auto mode, ask your gateway to implement: https://code.claude.com/docs/en/auto-mode-classifier-billing
+审查完成。我通读了 `src/lib/**`（账本、池、服务编排、上游客户端）、`src/app/api/**` 全部 29 个路由、前端页面、脚本、schema 与测试，并实际跑了 `npm run typecheck`（通过）与 `npx vitest run`（15 文件 / 250 用例全绿）、`npm audit`。
+
+---
+
+## 恶性肿瘤
+
+### [严重度: 高] 买家可自定义成交价，并把它写进全局价格表 —— 任意人可篡改所有人看到的价格且能拿回本金
+- 位置: `src/app/api/sms/get/route.ts:12,23` → `src/lib/service.ts:270-279,316` → `src/lib/grizzly.ts:504-519`
+- 触发（完整链路，已逐行核对）：
+  1. `/api/sms/get` 的 body 接受可选字段 `maxPriceUsd`，路由原样传给 `startActivation({ priceUsd: body.maxPriceUsd })`；
+  2. `service.ts:270` 一旦有 `priceUsd`，就**跳过** `getPriceProvider().quote()`，把客户端数字当成 `cost`，再 `cap = roundUp2(cost)` 作为扣款额（`service.ts:275-279`）——注释自己写的是"覆盖估价（管理端/测试用）"，但它是公开接口；
+  3. 取号成功后 `service.ts:316` 调 `getPriceProvider().observe(service, country, cost)`，把**客户端给的数字**以 `source="observed"` 写进 `PriceCache`（`grizzly.ts:517-519`）；
+  4. `PriceCache` 是 `@@unique([service, country])` 的**全局共享表**（`prisma/schema.prisma:PriceCache`），而 `quote()` 的顺序是 API → 缓存 → 兜底，本仓库文档明确说明上游 `getPrices*` 恒定返回 `BAD_ACTION`（`grizzly.ts:5-9`、`README.md:295`），所以**缓存就是唯一生效的价格来源**。
+  - 攻击只需一张余额 ≥ N 的卡：`POST /api/sms/get {service, country, maxPriceUsd:"5.00"}` → 上游取号成功（maxPrice=5 一定 ≥ 真实价）→ 缓存被写成 5.00 → 然后 `POST /api/sms/cancel` 拿回 5.00（`service.ts:696` 退款额 = `activation.costUsd` = 5.00），**本金归还，缓存污染保留**。上限受卡面值约束（单卡 1000 USD，`MAX_FACE_USD`）。
+- 后果：任意 (service, country) 的售价被外部永久改写。后续买家要么被按 $5.00 实收（`settleReservation` 不退，因为 `cost` 就是 5.00），要么因余额不够而**完全无法购买该组合**。这是对他人资金的直接影响 + 持续性业务中断，且只有上游价格接口恢复或人工改库才能复原。
+- 建议：① `/api/sms/get` 删除 `maxPriceUsd`，价格一律由服务端 quote 决定（确有需要就加 `requireAdmin`）；② `observe()` 只允许写服务端权威成本，绝不接受请求参数；③ `PriceCache` 增加单调保护/人工锁定与更新来源审计。
+
+### [严重度: 高] 卡密明文确实落库，与「只存 SHA-256、明文不落库」的公开承诺相反，且可能永久留存
+- 位置: `src/lib/pool.ts:380-386`（写入）→ `src/lib/service.ts:736-750`（`wipeStoredCode`）→ `src/lib/service.ts:790-800`（**仅在有人查单时**才抹）
+- 触发：付款发新卡时，`fulfillPaidOrder` 把明文写进 `Order.rawNotify` JSON：`{ code, codeAt, notify }`。抹除只发生在 `queryAndSettleOrder` 里——必须有人带着该 `outTradeNo` 打 `/api/pay/query`，且**已超过 24 小时**，才会 `delete record.code`。没人查过的订单，明文就一直躺在库里。
+- 后果：`README.md:313`「卡密明文**不落库**，只存 SHA-256」与 `pool.ts:643`「卡密明文只在此处返回一次，库里只存 SHA-256」两处声明均不成立。任何一次数据库导出/快照/备份（Neon 快照、`pg_dump`）都含有**可直接变现的卡密明文**，且不受 24 小时窗口约束；同时 `/api/admin/export` 刻意不导出明文的安全姿态（`export/route.ts:41-43`）被这条路径抵消。
+- 建议：要么发卡时把明文放进独立表并加 TTL 清理任务（定时物理删除，而非惰性抹除），要么改成"下单时由买家公钥加密存储"，并同步修正 README 与注释。
+
+### [严重度: 中] 充值路径完全绕过池容量闸门 → 无上限超卖
+- 位置: `src/lib/service.ts:66-97`（`createTopupOrder`，无任何 `checkPoolCapacity`）对比 `src/app/api/pay/create/route.ts:23-29`（新购有硬闸门）
+- 触发：登录任意卡密 → `POST /api/key/topup {amountUsd:"1000"}`，可重复提交任意笔。池子已耗尽（`availableUsd < 0`）时新购会被 409 拒绝，充值却直接建单、付款后 `fulfillPaidOrder` 无条件加余额（`pool.ts:314-318`）。
+- 后果：买家付了 LDC，站点就欠下等值的上游额度。设计上新购闸门就是为了"不卖出超过上游余额的承诺"，充值绕过后该不变量失效，直接体现为「已收钱但兑不出号」。单笔 1000 USD、笔数不限。
+- 建议：`createTopupOrder` 在 `checkFaceAmount` 之后加与 `/api/pay/create` 相同的 `checkPoolCapacity(amountUsd)` 判断（降级读数的放行策略保持与现有一致即可）。
+
+### [严重度: 中] 后台「取消锁定时长」设置是死设置：写库、展示，但服务端从不读取
+- 位置: 写入 `src/app/api/admin/settings/route.ts:14,79` / `src/lib/settings.ts:189`；**读取处却走环境变量**：`src/lib/service.ts:558`、`src/lib/service.ts:603`
+- 触发：后台把 `cancelLockSeconds` 从 90 改成 300 → 提示与 `GET /api/admin/settings` 都显示 300 → 实际 `cancelWindow()` 与 `cancelActivation()` 都调 `getConfig().CANCEL_LOCK_SECONDS`（env，默认 90），倒计时与拒绝阈值仍是 90 秒。
+- 后果：运营改了不生效且无任何提示，属于本项目已经踩过一次的同类回归（`pool.ts:82-91` 记录了 `safetyBufferUsd` 的完全相同病灶，且已修）。这里 `cancelRetrySeconds` 走了设置（`service.ts:643`），`cancelLockSeconds` 漏了，两套口径并存。
+- 建议：`cancelWindow` / `cancelActivation` 改读 `settings.cancelLockSeconds`；`cancelWindow` 是同步函数，需要把已取到的 settings 作为参数传入（`toPollResult` 的调用方在 `pollActivation` 里已经 `await getSiteSettings()`）。
+
+### [严重度: 中] 未处理异常的内部 message 原样回给客户端（含 Prisma 报错原文）
+- 位置: `src/lib/http.ts:154-156`
+- 触发：任何非白名单异常走 `console.error` 后 `return jsonError(INTERNAL, error.message, 500)`。例如 `README.md:113-115` 自己记录的 `The column Order.kind does not exist`，或任意 Prisma 校验错误（含模型名、列名、约束名、部分 SQL 片段），都会出现在无鉴权接口的响应体里。触发方式：未跑迁移时打任意公开接口。
+- 后果：向匿名调用者泄漏数据库结构、内部表名与迁移状态，为后续精准攻击提供情报。
+- 建议：500 一律返回固定文案（"服务器内部错误"），把 `error.message` 只留在服务端日志。
+
+### [严重度: 中] 预扣已提交、进程被杀 → 钱凭空消失，且现有审计看不见
+- 位置: `src/lib/service.ts:279`（扣款独立事务，返回即提交）→ `282-288`/`292-308`（只在 `getNumber`/建表**抛错**时才补退）→ 对比 `src/lib/grizzly.ts:295-296`（`timeoutMs=12_000`、`retries=3`，单次 `getNumber` 最坏可跑 ~37 秒）
+- 触发：Vercel 函数超时（Hobby 上限 10 秒，见 `README.md:275`）/实例回收/OOM 发生在扣款成功之后、`grizzly.getNumber` 返回之前。此时：卡密余额已被扣 `cap`、`KeyLedger` 有 `get_number` 流水、**但没有任何 `Activation` 行**。
+- 后果：买家余额静默减少，无任何补偿路径。更糟的是唯一的资金审计 `auditUnrefundedActivations`（`service.ts:1107-1115`）以 `Activation` 为主表遍历，**孤儿预扣完全不在它的扫描范围内**，因此"未退款审计"永远报 0，运营无从发现。
+- 建议：① 预扣与 Activation 落库放到同一个事务（先 `reserved` 状态写 Activation 再调上游）；② 补一条针对 `KeyLedger(reason='get_number', refId IS NULL)` 且超过 N 分钟无对应 Activation 的对账任务，自动补退或告警；③ 给关键路由加 `export const maxDuration` 并把上游 timeout/retries 压到函数预算内。
+
+### [严重度: 中] 公开接口无鉴权、无频率限制、无缓存 → 上游放大与内存无界增长
+- 位置: `src/lib/grizzly.ts:586,596-603`（`availabilityCache` 是模块级 `Map`，键为**用户传入的任意 country 字符串**，条目永不删除）；调用方 `src/app/api/catalog/availability/route.ts:8,13`、`src/app/api/sms/price/route.ts:8,24`、`src/app/api/site/stock/route.ts:30`、`src/app/api/pay/create/route.ts:23`；全仓库唯一限流在 `src/lib/admin.ts:142`，且只被 `admin/login` 使用
+- 触发：`GET /api/catalog/availability?country=<随机串>`×N —— 每个新串都 (a) 在 `availabilityCache` 里永久新增一个 `TtlCache` 条目，(b) 触发一次上游 `getNumbersStatus`。`country` 只有 `z.string().min(1)`，长度也不设限。`/api/site/stock` 与 `/api/pay/create` 每次请求都会实时打一次上游 `getBalance`（`pool.ts:130-132`，无缓存）。
+- 后果：单人即可让函数实例内存持续增长直至 OOM，并把站点/Grizzly 账号的配额打满（可能导致上游限流或封 key）。这是可用性与上游账号安全层面的现实风险。
+- 建议：`availabilityCache` 加 LRU 上限 + 按国家 ID 白名单校验（`/^\d+$|^any$/`，长度上限），给它加与 `countries/services` 同级的 TTL；对公开路由加统一频率限制（Upstash 已配置时优先走 Redis 计数）；`getRealBalance` 加 5~15 秒进程内 TTL 缓存。
+
+### [严重度: 中] 后台登录限流：进程内计数 + 计数表无界 + 取 `x-forwarded-for` 首段
+- 位置: `src/lib/admin.ts:127-139`（`attempts` 是 `Map`，键来自 `clientIp`）、`:132-138`（取 `forwarded.split(",")[0]`）
+- 触发：(a) 多实例/冷启动后计数各算各的，"每 IP 每分钟 10 次"在多实例下近似失效；(b) 首段是列表里最容易被客户端自带头部影响的位置——若代理是"追加真实 IP"，攻击者用 `X-Forwarded-For: <随机>` 即可每次都命中新的限流桶；(c) 每个不同的键都会永久留在 `attempts` 中，与 (b) 叠加即构成无界内存增长。
+- 后果：对 `ADMIN_TOKEN` 的暴力破解防线实际上不成立（虽然 8 位以上随机口令本身难以爆破，但这是**声称有、实际没有**的控制），并附带内存消耗。
+- 建议：改从平台可信头取值（Vercel 用 `x-real-ip` / `x-vercel-forwarded-for` 或取 XFF 最后一段），限流计数落到 Upstash（已配 `UPSTASH_REDIS_REST_*`），`attempts` 加 LRU/TTL 清理。
+
+### [严重度: 中] 「预扣上限 → 按真实成本退差额」这条承诺没有实现，买家按估价实收
+- 位置: `src/lib/service.ts:273-279,311-312`；`src/lib/ledger.ts:176-202`；对照 `README.md:64-65` 与 `service.ts:6`「按真实成本**退回差额**」
+- 触发：`cost = quote.priceUsd`（估价），`cap = roundUp2(cost)`，两者**同源**，`settleReservation(cap, cost)` 只能退回 1 分以内的取整残差。真实成交成本从未被告知（`getNumber` 只回 `ACCESS_NUMBER:<id>:<phone>`，`getStatusV2` 只取 `sms/text/message`，`grizzly.ts:472-486`），所以"真实成本"这个量在系统里根本不存在。
+- 后果：任何 (service, country) 首次成交前估价都是 `FALLBACK_PRICE_USD = "0.50"`（`grizzly.ts:455`），买家按 0.50 实收、卖家上游只花约 0.1x；`Activation.costUsd`、`getNetConsumedUsd`、对账等式里的"净消耗"随之全部是估价而非实际成本，资金报表与真实支出存在系统性偏差。同时 `observe()` 把**估价**标注为 `source="observed"` 写回缓存（`grizzly.ts:517`），使错误价格自我固化、永不收敛。
+- 建议：要么把 `observe` 的数据来源讲清楚（改名 `estimate`）并停止把它当"真实成交成本"，要么从上游可取的成本字段（`getStatusV2` / `getActiveActivations` 里的 price 字段）真正回填；对账口径需相应修正。
+
+### [严重度: 中] `/api/pay/query` 无鉴权即可换取卡密明文
+- 位置: `src/app/api/pay/query/route.ts:11-14`、`src/lib/service.ts:753-813`（`code` 直接返回给调用者）
+- 触发：`GET /api/pay/query?outTradeNo=GS...` —— 不带任何会话/Cookie，24 小时窗口内返回完整卡密明文。`outTradeNo` 同时被塞进 `returnUrl`（`service.ts:159` 的 `/shop?order=GS...`），因此会出现在浏览器地址栏、历史记录、截图中。
+- 后果：卡密即资金凭证，`outTradeNo` 一旦经 Referer/分享/日志外流，等于把卡直接送人。虽然 40 bit 随机（`service.ts:45-49`）使其无法枚举（因此评中而非高），但这是"凭据出现在 URL 里 + 接口不校验归属"的组合，与卡密应有的保护等级不匹配。
+- 建议：查单接口要求同时提供卡密会话或一次性查单令牌；把 `outTradeNo` 换成不可出现在 URL 的短期票据，或至少在返回 `code` 前要求 `requireSession` 且 `keyId` 与订单匹配。
+
+### [严重度: 中] 充值回跳参数 `?topup=` 无人处理，充值到账只剩回调一条路
+- 位置: 生成 `src/lib/service.ts:105`（`returnUrl: /shop?topup=${outTradeNo}`）；消费方 `src/app/shop/page.tsx:200-223` **只读 `params.get("order")`**，全仓库 grep 无任何地方读取 `topup`
+- 触发：买家充值付款后被 LDC 跳回 `/shop?topup=GS...`，前端什么都不做（`TopupPanel` 也不轮询），页面上只写着"付款后余额自动到账（通常几秒）"。若回调丢失/延迟（`/api/pay/notify` 一次失败即 500，靠平台重试），余额永远不加，且没有任何"主动查单补单"入口——而这个能力明明已经存在（`queryAndSettleOrder` 对 topup 订单同样可用，只是没人调用）。
+- 后果：买家已付款、余额未到账，只有人工介入。新购路径有兜底（`?order=`），充值路径没有，属实现遗漏。
+- 建议：`shop/page.tsx` 增加 `topup` 分支（复用同一个 `/api/pay/query` 流程），或在 `TopupPanel` 跳转前把 `outTradeNo` 存进 localStorage 并在回跳后主动查单。
+
+### [严重度: 低] 畸形 Cookie 触发 500 并泄漏内部错误文案
+- 位置: `src/lib/http.ts:273-285`（`parseCookies` 的 `decodeURIComponent` **没有 try/catch**）vs `src/lib/admin.ts:73-80`（同一段逻辑有 try/catch）；`http.ts:288-290` 把 `parseCookies` 放在 try 之外
+- 触发：`curl -H 'Cookie: glc_key=%' .../api/sms/status` → `URIError: URI malformed` 一路冒到 `withRoute` → 500 + 内部 message。
+- 后果：应为 401 的路径变成 500，且回显内部异常文案（与上文信息泄漏项叠加）。
+- 建议：两处 `parseCookies` 合并成一个带 try/catch 的实现。
+
+### [严重度: 低] `refId` 回填竞态，会污染未退款审计的归属
+- 位置: `src/lib/service.ts:333-342`（`attachLedgerRef` 用 `findFirst({reason:"get_number", refId:null}, orderBy createdAt desc)` 再 update）
+- 触发：同一张卡并发两次取号（两个标签页）→ 两次扣款流水都是 `refId=null` → 两次 `attachLedgerRef` 都抢"最新那条"，其中一条被写成错误归属，另一条永远保持 `refId=null`。
+- 后果：余额本身没错，但 `auditUnrefundedActivations`（`service.ts:1121`）按 `refId` 聚合净额，会把欠款算到错误的激活上或整条漏掉——即"自动复核装置"本身会给出错误结论。
+- 建议：扣款时就知道 activationId（先建 Activation 再扣款，或给 `KeyLedger` 加唯一 refId 约束并在同事务内写入），去掉事后回填。
+
+### [严重度: 低] 发卡池校验 TOCTOU
+- 位置: `src/lib/pool.ts:654-657`（先 `assertPoolCapacity`）→ `668-687`（另一事务内建卡）
+- 触发：两个并发的 `POST /api/admin/keys`（或后台连点）各自通过校验后都插卡。仅管理端可达、且有安全缓冲兜底，故评低。
+- 后果：短时超卖，上游余额不足以覆盖已发卡面值。
+- 建议：把容量校验挪进同一事务并对池做行级锁（或对单例行 `SELECT ... FOR UPDATE`）。
+
+### [严重度: 低] CSV 公式注入
+- 位置: `src/app/api/admin/export/route.ts:15-19`（`csvCell` 只处理 `"`、`,`、换行，不处理前导 `=`/`+`/`-`/`@`）
+- 触发：`note`（`keys` 导出）或 `name` 以 `=` 开头，管理员用 Excel 打开。
+- 后果：管理员本机被公式执行（自伤面为主，故评低）。
+- 建议：以 `=+-@` 开头的单元格前缀 `'`。
+
+### [严重度: 低] 审计在每次后台概览里做 200 次串行查询
+- 位置: `src/app/api/admin/overview/route.ts:16` → `src/lib/service.ts:1107-1122`（最多 200 条激活，每条一次 `keyLedger.findMany`）
+- 后果：概览页响应时间随历史数据线性增长，且这段在 `Promise.all` 之前串行执行。
+- 建议：改成一次 `groupBy refId` 聚合查询。
+
+### [严重度: 低] 其他
+- `src/app/admin/page.tsx:447` 用 `(result as never as { releasedUsd: string })` 绕过类型，应给 `adminPost` 传正确泛型。
+- 仓库根 `.probe-pending.json` **已被 git 跟踪**（`git ls-files` 可查），内含真实上游激活 ID 与时间戳，属于内部运维痕迹。
+- `scripts/check-secrets.mjs:10,49` 把整个 `scripts/` 目录从内容扫描中豁免，而 `probe-number.cjs` / `probe-watchdog.cjs` 就在那里读 `.env.local` 并持有密钥变量名——真实密钥若被贴进 `scripts/` 不会被拦截；`package.json` 未声明 `prepare`，`.githooks` 需要手动 `git config` 才生效，默认无保护。
+- `next.config.mjs` 无任何 `headers()`：没有 CSP / HSTS / `X-Content-Type-Options` / `X-Frame-Options`，也无 `middleware.ts`。后台页面可被第三方 iframe 嵌套（点击劫持），虽然 Cookie 是 `SameSite=Lax` 且状态变更走 JSON POST（预检拦住跨站），风险有限。
+- 已作废卡密在补退后余额仍会累加到 `revoked` 卡上且不计入 `getAllocatedUsd`（`ledger.ts:275` 的 credit 不校验 status），资金被搁死、只能靠人工 restore。
+
+---
+
+## 工程质量
+
+**没问题的部分（逐项确认过）**
+- **注入**：全仓库只有 `ledger.ts:264,272` 两处 `$queryRaw`，均为带标签模板的参数化查询（`${amountSql}::numeric`、`${keyId}`），无 `$queryRawUnsafe` / `$executeRawUnsafe` / `Prisma.raw` / `eval` / `child_process`。**未发现问题。**
+- **后台鉴权覆盖**：`src/app/api/admin/**` 共 11 个 route 文件，除 `login`/`logout`（自身是鉴权入口）外**全部**调用了 `requireAdmin`（activations / export / keys GET+POST / keys-action / ledger / orders / overview / reconcile POST+PUT / settings GET+PUT）。并有源码级测试钉住（`admin-routes-auth.test.ts:44-56`）。**未发现漏网的 route。**
+- **越权 / IDOR**：`pollActivation`（`service.ts:380`）与 `cancelActivation`（`service.ts:588`）都校验 `activation.keyId === session.keyId`；`/api/me/activations` 只按会话查询；`/api/key/topup` 的 body schema 只有 `amountUsd`，目标卡密完全来自 `requireSession`（并有测试断言 schema 字段，`topup.test.ts:190-198`）。**未发现越权。**
+- **会话伪造**：HMAC-SHA256 + `constantTimeEqual`；买家密钥 `cookieSecret` 与后台密钥 `${cookieSecret}/admin/v1` 做了域分离，两者不可互换；卡密查询走 `codeHash` 唯一索引，80 bit 熵不可枚举。**未发现可伪造/重放路径**（唯一可议之处：`adminSecret` 由 `LDC_KEY` 派生且派生串公开在源码里，因此 `LDC_KEY` 泄漏 = 后台会话可伪造，且**改 `ADMIN_TOKEN` 不会吊销既有 Cookie**；建议引入独立 `SESSION_SECRET`）。
+
+**问题**
+1. **最关键的 SQL 没有测试覆盖。** `ledger.test.ts` 用的是手写内存假实现，真正的原子条件 UPDATE（`ledger.ts:263-277` 的 `status='active' AND balanceUsd >= x` 语义、`RETURNING`、以及 `depleted/active` 联动）从未在真实 Postgres 上跑过。假实现也没有实现 depleted 状态转换，两边已经出现语义分叉——"铁律"目前只有代码注释和假实现背书。
+2. **存在若干"源码文本断言"型测试**，回归能挡住、但会因无关重构误报、也会在逻辑坏死时通过：
+   - `service.test.ts:392-399` 从 `sweepStaleActivations` 切片到**文件末尾**再断言不含 `refund`/`getLedger` 等子串——它之所以通过，仅仅因为该函数恰好是文件最后一个函数；一旦调整函数顺序就会误报，而把退款逻辑抽成 helper 改名后又会漏报。
+   - `topup.test.ts:223-227`、`topup.test.ts:183-188` 同样是 `readFileSync` + `toContain`。
+   - `admin-routes-auth.test.ts:44-56` 只断言文件里出现 `requireAdmin` 字符串，**不保证它在 handler 开头执行**（写在耗时逻辑之后一样通过）。
+3. 类型逃逸极少：生产代码只有 `admin/page.tsx:447` 一处 `as never`；`any` 仅出现在测试。整体 `strict: true` 且 `tsc --noEmit` 通过。**这一项质量不错。**
+4. 错误处理整体规范（`withRoute` 统一兜底、`maybeSweep*` 内部 try/catch 后 `void` 调用，无未捕获 Promise），唯一缺陷是上面提到的"500 回显内部 message"。
+5. 重复逻辑：`http.ts` 与 `admin.ts` 各有一份 `parseCookies`（且行为不一致，见上）；`service.ts:558` 与 `:603` 重复实现了同一条锁定公式，`cancelWindow`/`cancelActivation` 两处口径易漂移。
+6. 索引覆盖尚可（`Activation[keyId,status]`、`[status,createdAt]`、`KeyLedger[keyId,createdAt]`、`Order[status,createdAt]`、`[targetKeyId,status]` 与现有查询基本对应）；`PoolReservation` 表实际上不参与任何池计算（`getAllocatedUsd` 用的是 `sum(CardKey.balanceUsd)`），`released` 字段是纯装饰，容易误导后续维护者以为释放逻辑有账可依。
+
+---
+
+## 开源就绪度
+
+| 项 | 结论 | 理由 |
+|---|---|---|
+| README 说清是什么/怎么跑/环境变量/怎么部署 | **是** | `README.md` 结构完整：定位、架构树、API 表、账本铁律、本地开发、Vercel 部署（含 Neon/Upstash）、对账口径、已知缺口。本地四步（`cp .env.example` → `npm install` → `db:push` → `dev`）可直接执行。仅两处过时：API 表缺 `pay/quote`、`key/topup`、`cron/sweep`、`admin/settings`、`admin/orders` 等已实现路由；测试章节只列了 6 个测试文件（实际 15 个）。 |
+| LICENSE | **否** | 仓库根无 `LICENSE`；`package.json` 有 `"private": true`。无授权文件即默认"保留所有权利"，无法被合法复用。 |
+| `.env.example` 齐全且不含真实值 | **是** | 14 个键齐全、全为占位符；`.env.local`/`.env.vercel` 虽在磁盘上但被 `.gitignore` 覆盖，且 `git log --all -- .env.local .env.vercel` 为空、`git ls-files` 中只有 `.env.example`——从未入库。 |
+| `.gitignore` 覆盖 `.env*` / `.next` / `node_modules` | **是** | 三项均有；另含 `out/build/dist/coverage/*.tsbuildinfo/next-env.d.ts/.vercel/*.log`。唯一小缺口：`.probe-pending.json` 未列入（且已被跟踪）。 |
+| CONTRIBUTING / SECURITY.md | **否** | 两者都不存在。涉及真钱的仓库没有安全披露渠道是个明显缺口。 |
+| 代码里残留内部信息 | **基本是，但有一处** | `src/` 内无真实域名/邮箱/内网 IP（仅上游官方域名与 `example.test` 测试值）；`.env.local` 中的 `NEXT_PUBLIC_APP_URL=https://grizzly-ldc-shop.vercel.app` 是线上地址但未入库。**问题**：`.probe-pending.json` 已被跟踪，含真实上游激活 ID 与取号时间（`scripts/probe-watchdog.cjs:16` 仍在引用它），开源前应移除。 |
+| 依赖是否过时/含已知漏洞 | **有告警，需正视** | `next@15.5.27` 与 README 声明的 CVE-2025-66478 修复版本一致（好）。但 `npm audit` 报 **5 项（4 high / 1 moderate）**：`deepmerge-ts <8`（经 `@prisma/config` → `prisma` CLI，构建期）、`postcss <=8.5.22`（经 `next` 内置依赖，构建期 CSS 处理）。**均为构建期工具链、无运行时可达路径**，且修 `postcss` 需要升到 `next@16`（破坏性）。其余依赖普遍落后 1~2 个大版本（prisma 6→7/8、zod 3→4、tailwind 3→4、vitest 2→5）。建议在 README 里如实写清"这 5 项为构建期依赖告警"而不是留白。 |
+| 可用的一键验证命令 | **是** | `npm run typecheck`（实测通过）、`npm test`（实测 15 文件 / 250 用例全绿）、`npm run lint`、`npm run build`，README 均有列出。`npm run lint` 依赖交互式 `next lint` 首次配置，CI 里可能卡住——小瑕疵。 |
+| 注释是否含过度内部信息 | **是，且相当多** | `README.md:202-219`「老板手动设的汇率」「老板定的规则」、`settings.ts:72-73`「老板 2026-10-11 决定先不启用」、`pool.ts:84-90`、`service.ts:967-969`「实测 wa/151 那笔 $0.12 卡了一整天」、`admin/keys/action/route.ts:80`「老板 2026-10-13 实测踩到」。这些是**真实的运营细节与经营数据**（包括具体金额与卡密前缀模式）。开源前应改写成中性技术说明。 |
+
+---
+
+## 总评
+
+**能不能公开开源**：**当前状态下不建议**，需要先做安全修复与一轮"脱敏"提交。工程质量明显高于同类小项目（分层清晰、账本抽象、250 个测试全绿、类型纪律好、注释解释"为什么"而非"是什么"），代码本身是体面的；但它是**按"私有运维"假设写的**——注释里带老板的决策与实测金额、仓库里有生产域名与真实激活 ID、缺 LICENSE/SECURITY。
+
+**最大风险，按优先级**：
+
+1. **客户端定价污染全局价格表（`maxPriceUsd` → `PriceCache`）**。这是唯一的"外部可触发、影响他人资金、且攻击者能全身而退"的路径，必须最先修：删掉这个入参，并让 `observe()` 拒绝任何来自请求的值。
+2. **资金账目的"真实性"缺口**：`costUsd` 实为估价、"差额退回"是同一数字自减、孤儿预扣不可审计（`settleReservation` 那套机制目前是**装饰性的**）。铁律说的是"按真实成本退差额"，但系统里没有"真实成本"这个量。这一条不修，后台看到的对账与利润都是估算。
+3. **充值绕过池闸门**：买家能付钱买下不存在的上游额度，是负债而非漏洞，但会以"兑不出号"的形式爆雷。
+4. **明文卡密落库且惰性抹除**：把整个 SHA-256 设计的价值抹平了，且 README 的公开承诺与实现不符——对外开源后这句话会被当成虚假声明。
+5. **公开路由零限流 + 无界内存缓存**：便宜且有效的 DoS/上游滥用入口。
+
+如果只做三件事：**① 去掉 `maxPriceUsd` 并保护 `observe()`；② 给 `availabilityCache` 加上限、给公开路由加限流；③ 发卡明文改 TTL 物理清理并修正 README**——风险会从"不可开源"降到"可开源但需标注已知缺口"。

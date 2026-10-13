@@ -1,0 +1,96 @@
+[Codex 只读审查 · 2026-10-13]
+（原始输出含大量执行日志，此处仅保留最终报告）
+
+## 恶性肿瘤
+
+### [严重度: 中] 「真实成交成本」从未向 Grizzly 核实，取消退款按前端传入的估价退钱
+- 位置: `src/app/api/sms/get/route.ts:12,23`（`maxPriceUsd` 由前端传入）→ `src/lib/service.ts:270-273`（`priceUsd` 覆盖估价）→ `src/lib/service.ts:696`（退款额 = `activation.costUsd`）
+- 触发: 上游 `getPrices`/`V2`/`V3` 在本 host 实测返回 `BAD_ACTION`（`src/lib/grizzly.ts:455` 注释、README:295），所以估价只能走 `PriceCache` 或兜底常量 `$0.50`（`src/lib/grizzly.ts:455`）。而 `startActivation` 从不查询这笔激活的真实扣费，只把**估价**写进 `Activation.costUsd`（`src/lib/service.ts:301`），并在成交后把这个估价回填成 `observed` 缓存（`src/lib/service.ts:316`）。
+- 后果: 兜底价 `$0.50` 会被当成"真实成本"永久写进 `PriceCache` 并回退给下一个买家；更关键的是**退款**按 `costUsd` 退（`service.ts:696`），而不是按 Grizzly 实际扣的钱。若某组合真实成本高于缓存值，取消时会把差额补给买家（站点倒贴）；若真实成本低于缓存值，买家被多扣。README 明确称这是"已知缺口"，但它直接决定退款金额，属于资金口径问题。
+- 建议: 引入一个"真实成本"来源（Grizzly 的 `getStatusV2`/账单字段，或按 `getNumber` 请求里的 `maxPrice` 成交价），退款一律以它为准；兜底价不要写回 `observed`，单独标 `source=fallback`。
+
+### [严重度: 中] 取号上限由客户端回传，可绕过服务端报价（少扣钱）
+- 位置: `src/app/api/sms/get/route.ts:8-13,19-24`、`src/lib/service.ts:270-275`
+- 触发: 请求体 `maxPriceUsd` 是任意数字，`startActivation` 直接 `dec(input.priceUsd)` 当成本，并作为 `getNumber(maxPrice=cap)` 的上限。前端（`src/app/shop/page.tsx:418`）只是把自己上次拿到的 `quote.maxPriceUsd` 回传。
+- 后果: 汇率/毛利变化后，攻击者仍可用**旧的**（更低的）`maxPriceUsd` 取号并成交，按旧价扣费，站点少收钱。极端情况传 `"0.01"` 只会让上游 `WRONG_MAX_PRICE` 失败并全额退回（无害），但传一个"比当前报价略低、又仍 ≥ 真实成本"的值即可稳定套利。
+- 建议: 服务端忽略客户端传入的 `maxPriceUsd`，一律用 `getPriceProvider().quote()` 重新估价（或只允许它作为**上限**、不得低于服务端报价）。
+
+### [严重度: 中] 管理后台登录限速形同虚设（IP 取错）
+- 位置: `src/lib/admin.ts:126-133`（`clientIp` 取 `x-forwarded-for` 的**第一段**）→ `src/app/api/admin/login/route.ts:15-19`
+- 触发: 在 Vercel 上 `x-forwarded-for` 是 `<真实客户端>, <Vercel 代理>`，第一段是客户端可控的。攻击者每次请求伪造一个新的首段，即可让 `attempts` Map 里每次都是新键，`LOGIN_MAX_ATTEMPTS=10`（`src/lib/admin.ts:128`）永不触发。
+- 后果: 对 `ADMIN_TOKEN` 的暴力破解没有有效限速，只靠口令本身强度（且 `ADMIN_TOKEN` 下限仅 8 字符，`src/lib/config.ts:64`）。
+- 建议: 取 `x-forwarded-for` 的**最后一段**（Vercel 代理写入的可信值），或直接用 `x-real-ip`；同时把 `ADMIN_TOKEN` 最短长度提到 32。
+
+### [严重度: 中] 弃单核账会对"还有可能出码"的号码退款，与上游 20 分钟红线冲突
+- 位置: `src/lib/service.ts:1014-1020`（无差别扫描所有 `waiting`，`take:20`）→ `src/lib/service.ts:1022`（`confirmMs` = `DEFAULT_CONFIRM_CANCEL_MINUTES`=6 分钟）→ `src/lib/service.ts:1043-1056`（过了 6 分钟就 `cancelActivationInternal` 退款）
+- 触发: 某组合真实出码耗时 > 6 分钟（上游号码"有效期起 20 分钟内可退款"，见 `src/lib/service.ts:390`）。核账扫描到该激活时上游仍处于可取消态、返回 `STATUS_CANCEL`，于是立刻把钱退给买家。
+- 后果: 买家可能随后仍在上游侧收到验证码（号码并未真正作废），形成"既退款又拿码"的口子——正是代码注释里说已修的那类竞态，这里被时间窗口重新打开。此外该扫描无号龄下界，`take:20` 时**最老的 20 笔**优先被处理，老号风险最高。
+- 建议: 退款前要求"上游 `CANCEL` 且本地号龄 ≥ 上游可退款窗口上限"（并留余量），或改用 `ACCESS_CANCEL` 的成功回执作为唯一退款凭据；扫描按 `createdAt` 升序取**新**的、并跳过刚创建的。
+
+### [严重度: 低] `attachLedgerRef` 是"先读后写"，且不在事务内
+- 位置: `src/lib/service.ts:333-342`（`findFirst` 最近一条 `reason="get_number" AND refId=null` → `update`），调用点 `src/lib/service.ts:309`
+- 触发: 同一张卡并发取号时，两次 `debitOrThrow`（`service.ts:279`）各写一条 `refId=null` 的流水；两次 `attachLedgerRef` 都可能选中**同一条**（`orderBy: createdAt desc`，时间戳同毫秒），另一条永久留 `refId=null`。
+- 后果: `auditUnrefundedActivations` 按 `refId = activation.id` 汇总（`src/lib/service.ts:1121`），漏挂的激活净额算成 0，不会被列为欠款——审计出现假阴性；对账本身不受影响（`getNetConsumedUsd` 不看 refId）。
+- 建议: 让 `debitOrThrow` 直接带 `refId`（先建 Activation 再扣费，或把 activationId 传给 ledger），彻底去掉这个补偿步骤。
+
+### [严重度: 低] 上游原始报文被回传客户端
+- 位置: `src/lib/http.ts:133`（`upstreamRaw: error.raw.slice(0, 200)`），经 `toErrorResponse` 下发
+- 触发: 任何触发 `GrizzlyApiError` 的请求（如 `getNumber` 异常）。
+- 后果: 把 Grizzly 的原始响应文本（含内部错误码、可能的账号信息）泄漏给买家；虽已截断 200 字符，仍属信息外泄面。
+- 建议: 服务端只记日志，响应体只保留映射后的 `code`。
+
+### [严重度: 低] 管理口令可进浏览器内存；上游估价接口完全无鉴权
+- 位置: `src/app/admin/page.tsx:180`（`placeholder="ADMIN_TOKEN"`，登录框口令）、`src/app/api/sms/price/route.ts:15`（公开无鉴权）
+- 触发: 管理员在后台页输入口令（进 JS 内存）；任何人可打 `/api/sms/price`。
+- 后果: 口令泄露面略增（属可接受权衡）；`/api/sms/price` 无限速，可被刷爆 Grizzly 配额（其内部 `TtlCache` 有 60s 缓存，实际影响有限）。
+- 建议: 保持现状即可，若要收紧可给公开估价接口加简单限速。
+
+### 未发现（已逐项确认）
+- **双花 / 并发扣费**：`src/lib/ledger.ts:263-278` 的原子条件 UPDATE（`WHERE status='active' AND balanceUsd >= $1` + `RETURNING`）正确，扣费路径无"先读后写"；余额不足返回 0 行 → `InsufficientBalanceError` → 402。此条**未发现问题**。
+- **退款幂等**：`cancelActivationInternal`（`src/lib/service.ts:686-699`）用 `updateMany({status:'waiting'})` 抢占，重复调用只退一次；`pollActivation` 的 OK 认领（`service.ts:430-441`）也用了同样的抢占。**未发现问题**。
+- **预扣/实扣差额**：`settleReservation`（`src/lib/ledger.ts`，`reserved-actual`，`diff<=0` 不退）逻辑正确，`getNumber` 失败/建记录失败均全额退回（`service.ts:286,306`）。**未发现问题**。
+- **管理后台鉴权覆盖**：逐个检查 `src/app/api/admin/**` 全部 12 个 route，除 `login`/`logout`（鉴权入口本身）外全部调用 `requireAdmin`（`src/lib/admin.ts:106`）；`cron/**` 走 `requireBearer(CRON_SECRET)`。**未发现漏网 route**。
+- **越权 / IDOR**：`sms/get`、`sms/cancel`、`sms/status`、`me/activations`、`key/topup` 全部由 `requireSession` 取 `keyId`，并在服务层校验 `activation.keyId !== keyId`（`service.ts:380,588`）；充值目标卡密只来自会话（`service.ts:66-67`），不接受前端 `keyId`。**未发现问题**。
+- **注入**：全仓无 `$queryRawUnsafe`/`$executeRawUnsafe`；唯一的裸 SQL 在 `src/lib/ledger.ts:264-277`，参数以 `${...}::numeric` 绑定，`keyId` 亦为绑定参数。**未发现问题**。
+- **密钥硬编码 / 进前端 bundle**：`git grep` 无真实密钥、无真实域名/邮箱/内网 IP（仅测试用 `example.test`）；`NEXT_PUBLIC_*` 只用于 `NEXT_PUBLIC_APP_URL`，未导出任何密钥。**未发现问题**。
+- **卡密明文不落库**：只存 SHA-256（`src/lib/keycodec.ts:79`）；明文仅在订单页 24 小时窗口内可取回（`service.ts:724`），之后 `wipeStoredCode` 抹除；CSV 导出刻意不含明文（`admin/export/route.ts:42`）；`admin/activations` 只返回 `hasCode: Boolean`。**未发现问题**。
+- **会话伪造/篡改**：HMAC-SHA256 + 常量时间比较，先验签后解析，买家/管理员密钥与 subject 均隔离（`keycodec.ts:121`、`admin.ts:42`）。**未发现问题**（仅"登出不能服务端吊销、12h 重放窗口"属低危，见下）。
+
+---
+
+## 工程质量
+
+- **未捕获 Promise / 降级吞钱**：`src/lib/service.ts:459` 的 `balanceUsd: refund.balanceUsd` 可能是 `null`，但类型声明为 `string | null`，前端 `shop/page.tsx:438` 断言为 `string`——只是显示问题，非资金问题。
+- **`void` 机会式任务**：`sms/status/route.ts:18,20` 用 `void maybeSweepStaleActivations()` / `maybeReconcileAbandoned()`，二者内部有 try/catch（`service.ts:875-885, 878-886`），不会产生 unhandled rejection。**OK**。
+- **死代码**：`src/lib/idempotency.ts` 的 `withLock/tryWithLock/claimIdempotencyKey/runIdempotent` 以及 `Upstash` 依赖**没有任何生产调用点**（仅测试引用）；`LdcClient.refund()`（`ldc.ts:239`）也从未被调用；`LDC_PRIVATE_KEY_B64`、`LDC_PID` 中前者完全未用，`.env.example` 描述的"ldcpay（Ed25519）"未实现。README 却称 Upstash 是"可选但推荐"——与事实不符。
+- **类型逃逸**：`src/app/admin/page.tsx:447` 用 `as never as {releasedUsd:string}` 绕过类型；测试里若干 `as any`/`as never`（可接受）。生产代码仅此一处，影响小。
+- **设置项与实际生效值不一致**：后台可改 `cancelLockSeconds`（存 `Setting` 表、经 `/api/site/config` 下发、前端据此显示倒计时），但服务端 `cancelActivation`/`cancelWindow` 读的是**环境变量** `getConfig().CANCEL_LOCK_SECONDS`（`service.ts:574,619`）。后台改这项不会真正改变服务端闸门，而前端会显示错误的倒计时。
+- **索引**：`Activation @@index([status, createdAt])`（schema:64）覆盖 `sweepStaleActivations`/`reconcileAbandoned`；`KeyLedger @@index([keyId, createdAt])` 覆盖 `me/activations` 与 `admin/ledger`；`Order @@index([status, createdAt])`、`[targetKeyId,status]` 齐备。**索引覆盖实际查询，无缺失**。
+- **测试质量**：`ledger.test.ts`（内存假实现，断言"扣费路径从不调用只读余额查询"）与 `service.test.ts`（真 mock 行为断言，覆盖竞态、退款幂等、审计）是**真测试**。但 `pool.test.ts:65-79`、`service.test.ts:392-432`、`adjust-face.test.ts:14-50` 属于**源码级断言**（`readFileSync` + `toContain`）——只验证"代码文本长这样"，重构即失效，是"假测试"的典型；且当前 HEAD 的 `adjust-face.test.ts` 会因行号漂移而失败（见下）。
+- **`npm test` 在 HEAD 不可用**：`adjust-face.test.ts:18-19` 用 `src.indexOf('if (body.action === "adjust")')` 截取函数体，但 `src/app/api/admin/keys/action/route.ts:34-99` 里的 `adjust` 分支在 `faceAfter` 处含有字面量 `body.action === "revoke"`（`route.ts:101`），截取正确；问题在于该测试依赖精确文本，非常脆弱。（本沙箱只读，无法实跑 vitest 确认，请以 CI 为准。）
+
+---
+
+## 开源就绪度
+
+- [ ] README 说清是什么/怎么跑/环境变量/怎么部署 —— **是**。`README.md:73`（本地开发）、`:97`（Vercel 部署）、`:121-136`（环境变量表）齐全，还含"改 schema 必须同步线上库"的血泪警告。
+- [ ] LICENSE —— **部分**。仓库根目录**存在** `LICENSE`（MIT，1086 字节），但 `git status` 显示它**未提交**（`?? LICENSE`），当前提交里没有。公开前必须 `git add`。
+- [ ] `.env.example` 齐全且不含真实值 —— **是**。`/ .env.example` 32 行，全为占位符（`your_grizzly_api_key_here` 等），无真实值。
+- [ ] `.gitignore` 覆盖 `.env*`/`.next`/`node_modules` —— **是**。`.gitignore:1`（`node_modules/`）、`:2`（`.next/`）、`:12-16`（`.env`、`.env.local`、`.env.*.local`、`.env.production`、`.env.vercel`），另有 `.probe-pending.json`（`:27`，含真实上游激活 ID）。**注意**：`.gitignore` 本身是未提交的修改（`git status` 显示 ` M .gitignore`），且 HEAD 里仍**跟踪着** `.probe-pending.json`（当前是 staged deletion）。
+- [ ] CONTRIBUTING / SECURITY.md —— **否**。仓库根目录无二者（只有 `node_modules` 里的第三方文件）。README 有"安全"小节但非独立政策文件。
+- [ ] 残留内部信息 —— **基本干净**。无真实域名/邮箱/内网 IP；真实主机名仅 `api.grizzlysms.com`、`credit.linux.do`（业务必需）。但**注释里运营细节偏多**：`service.ts:893`「wa/151 那笔 $0.12 卡了一整天」、`settings.ts:61`、`admin/keys/action/route.ts:66`「老板 2026-10-13 实测踩到」等。
+- [ ] 依赖过时/含已知漏洞 —— **否**。`next ^15.5.27`（README:310 说明已规避 CVE-2025-66478）、`@prisma/client ^6.2.1`、`react ^19`、`zod ^3.24`，无已知漏洞版本；`@upstash/redis` 为死依赖（见上）。
+- [ ] 一键验证命令 —— **是**。`package.json` 提供 `lint`/`typecheck`/`test`/`build`，README:82-89 列出。
+- [ ] 注释含过度内部信息 —— **是**（见上：老板决策、真实激活 ID、金额）。
+
+---
+
+## 总评
+
+**能不能公开开源：可以，但需先做 4 件事**——① 提交 `LICENSE` 并删除 `.gitignore` 里对 `.probe-pending.json` 的跟踪；② 补 `SECURITY.md`；③ 清理注释里的运营细节（真实激活 ID、金额、"老板"决策）；④ 决定是否保留那些永不执行的 `idempotency.ts`/Upstash 依赖，避免 README 与实现不符。
+
+**最大风险（真金白银相关）**：**退款口径建立在"估价"之上而非上游真实扣费之上**。`Activation.costUsd` 从头到尾都是 `PriceProvider` 的估算值（`service.ts:301`），退款直接退它（`service.ts:696`），而估价源因上游价格接口不可用只能退化到缓存/兜底常量（`grizzly.ts:455`），并且这个估价还会被回填成 `observed` 永久复用（`service.ts:316`）。叠加 `maxPriceUsd` 由客户端回传（`sms/get/route.ts:23`），一个懂行的买家可以稳定地"按旧价/低价取号、按估价退款"，把差额留给站点。其次是**弃单核账的 6 分钟窗口**（`service.ts:1022,1043`）可能对仍能出码的号码退款，重新打开"既退款又拿码"的竞态。
+
+正面结论：**账本核心（原子条件 UPDATE、扣费/退款幂等、发卡与充值入账）实现得相当扎实**，`ledger.ts` 与 `cancelActivationInternal` 经得起并发推敲，后台鉴权覆盖完整无遗漏，卡密明文确实不落库。资金安全的问题集中在"金额来源不可信"和"时间窗口判断"两处，而非账本本身。
+
+未修改任何文件（只读审查）。
