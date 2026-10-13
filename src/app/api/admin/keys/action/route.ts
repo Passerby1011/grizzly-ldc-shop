@@ -72,13 +72,36 @@ export const POST = withRoute(async (request: Request) => {
     }
 
     const { getLedger } = await import("@/lib/ledger");
-    const entry = await getLedger()
-      .manualAdjust(undefined, key.id, delta.toFixed(2), `admin:${key.codePrefix}`)
-      .catch((error: unknown) => {
-        /* 减额超过余额 → 账本抛 InsufficientBalance，转成 400 而不是 500 */
-        const message = error instanceof Error ? error.message : String(error);
-        throw badRequest(message);
+    /*
+     * 调额度的同时同步面值，否则会出现「面值 $0.01 但余额 $0.20」这种
+     * 自相矛盾的展示（老板 2026-10-13 实测踩到）。
+     *
+     * 口径：面值按 manual **净额**同幅变动，保持不变量
+     *       面值 = 余额 + 该卡净消耗
+     *   （净消耗 = -(get_number + adjust_reserve + cancel_refund)）
+     * 这样"扣了没退"的审计才能用同一条公式检查所有卡，不会误报。
+     *
+     * 例：老板给 $0.01 的卡 +0.19 → 面值 $0.20；
+     *     若之后又 -0.01，余额 $0.19，面值同时也回落到 $0.19（净额口径）。
+     * 下限 0：面值不该是负数（展示无意义），这种极端序列会由审计另行暴露。
+     */
+    const newFace = dec(key.faceUsd.toString()).plus(delta);
+    const faceAfter = newFace.lt(0) ? dec(0) : newFace;
+
+    const entry = await prisma.$transaction(async (tx) => {
+      const e = await getLedger()
+        .manualAdjust(tx, key.id, delta.toFixed(2), `admin:${key.codePrefix}`)
+        .catch((error: unknown) => {
+          /* 减额超过余额 → 账本抛 InsufficientBalance，转成 400 而不是 500 */
+          const message = error instanceof Error ? error.message : String(error);
+          throw badRequest(message);
+        });
+      await tx.cardKey.update({
+        where: { id: key.id },
+        data: { faceUsd: faceAfter.toFixed(4) },
       });
+      return e;
+    });
 
     const after = await prisma.cardKey.findUnique({ where: { id: key.id } });
 
@@ -87,8 +110,9 @@ export const POST = withRoute(async (request: Request) => {
       codePrefix: key.codePrefix,
       deltaUsd: delta.toFixed(2),
       balanceUsd: entry.balanceAfter.toFixed(2),
+      faceUsd: after ? dec(after.faceUsd.toString()).toFixed(2) : null,
       status: after?.status ?? key.status,
-      notice: `已调整 ${delta.gt(0) ? "+" : ""}${delta.toFixed(2)} USD，当前余额 ${entry.balanceAfter.toFixed(2)} USD（已写入 manual 流水，对账不会因此产生差额）`,
+      notice: `已调整 ${delta.gt(0) ? "+" : ""}${delta.toFixed(2)} USD，当前余额 ${entry.balanceAfter.toFixed(2)} USD、面值 ${after ? dec(after.faceUsd.toString()).toFixed(2) : "-"} USD（已写入 manual 流水，对账不会因此产生差额）`,
     });
   }
 
