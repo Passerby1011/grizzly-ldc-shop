@@ -4,7 +4,15 @@ import { GRIZZLY_STATUS, GrizzlyApiError, type GrizzlyClient } from "../grizzly"
 import { ApiError } from "../http";
 import { readFileSync } from "node:fs";
 import { getEnvFallbackSettings } from "../settings";
-import { cancelActivation, pollActivation, reconcileAbandonedActivations, sweepStaleActivations } from "../service";
+import {
+  auditUnrefundedActivations,
+  canLogin,
+  cancelActivation,
+  isKeyUsable,
+  pollActivation,
+  reconcileAbandonedActivations,
+  sweepStaleActivations,
+} from "../service";
 
 const mocks = vi.hoisted(() => {
   const activation = {
@@ -13,12 +21,14 @@ const mocks = vi.hoisted(() => {
     updateMany: vi.fn(),
     findMany: vi.fn(),
   };
+  const keyLedger = { findMany: vi.fn() };
   const prisma = {
     activation,
+    keyLedger,
     $transaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback({ activation })),
   };
   const grizzly = { setStatus: vi.fn(), getStatus: vi.fn() };
-  return { activation, prisma, grizzly };
+  return { activation, keyLedger, prisma, grizzly };
 });
 
 vi.mock("../db", () => ({ getPrisma: () => mocks.prisma }));
@@ -513,5 +523,117 @@ describe("reconcileAbandonedActivations：弃单核账（资金安全，独立�
 
     expect(r.scanned).toBe(0);
     expect(mocks.grizzly.getStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe("canLogin / isKeyUsable：余额归零不能取号，但必须能登录", () => {
+  /*
+   * 曾经的缺陷：登录判据直接用 isKeyUsable，于是余额扣到 0 → 状态变 depleted
+   * → 登录被拒 → 而充值接口又要求先登录 → 用户被锁在门外，想充钱都进不来。
+   * 这是死路，所以两个判据必须分开。
+   */
+  it("depleted（余额用光）可以登录，但不能取号", () => {
+    const key = { status: "depleted", expiresAt: null };
+    expect(canLogin(key)).toBe(true);
+    expect(isKeyUsable(key)).toBe(false);
+  });
+
+  it("active 两个都放行", () => {
+    const key = { status: "active", expiresAt: null };
+    expect(canLogin(key)).toBe(true);
+    expect(isKeyUsable(key)).toBe(true);
+  });
+
+  it("revoked 两个都拒绝", () => {
+    const key = { status: "revoked", expiresAt: null };
+    expect(canLogin(key)).toBe(false);
+    expect(isKeyUsable(key)).toBe(false);
+  });
+
+  it("过期的卡两个都拒绝", () => {
+    const key = { status: "active", expiresAt: new Date(Date.now() - 1000) };
+    expect(canLogin(key)).toBe(false);
+    expect(isKeyUsable(key)).toBe(false);
+  });
+});
+
+describe("核账：上游说激活不存在（NO_ACTIVATION）也要把钱退回", () => {
+  it("NO_ACTIVATION → 视同已取消并退款，而不是每轮抛错跳过", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      activationRow({ createdAt: new Date(Date.now() - 30 * 60_000), costUsd: "0.12" }),
+    ]);
+    mocks.activation.findUnique.mockResolvedValue(activationRow({ costUsd: "0.12" }));
+    mocks.activation.updateMany.mockResolvedValue({ count: 1 });
+    mocks.grizzly.getStatus.mockRejectedValue(
+      new GrizzlyApiError("NO_ACTIVATION", "NO_ACTIVATION"),
+    );
+
+    const r = await reconcileAbandonedActivations();
+
+    /* 以前这里会进 errors 并 continue —— 钱永远卡住 */
+    expect(r.errors).toBe(0);
+    expect(r.refunded).toBe(1);
+    expect(r.refundedUsd).toBe("0.12");
+  });
+
+  it("其它上游错误（网络抖动）仍记 errors 留待下轮，不误退", async () => {
+    mocks.activation.findMany.mockResolvedValue([activationRow()]);
+    mocks.grizzly.getStatus.mockRejectedValue(new Error("socket hang up"));
+
+    const r = await reconcileAbandonedActivations();
+
+    expect(r.errors).toBe(1);
+    expect(r.refunded).toBe(0);
+  });
+});
+
+describe("未退款审计：找出扣了费没退钱的激活", () => {
+  it("净额为负的激活会被列出并算欠款", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      {
+        id: "act-x",
+        grizzlyId: "gx",
+        service: "wa",
+        country: "12",
+        phone: "18048093684",
+        status: "cancelled",
+        costUsd: "0.12",
+        reservedUsd: "0.12",
+        createdAt: new Date(Date.now() - 30 * 60_000),
+        key: { codePrefix: "GS-AAAA" },
+      },
+    ]);
+    /* 只扣没退 */
+    mocks.keyLedger.findMany.mockResolvedValue([{ deltaUsd: "-0.12" }]);
+
+    const r = await auditUnrefundedActivations();
+
+    expect(r.suspicious.length).toBe(1);
+    expect(r.suspicious[0].keyPrefix).toBe("GS-AAAA");
+    expect(r.suspicious[0].owedUsd).toBe("0.1200");
+    expect(r.totalOwedUsd).toBe("0.1200");
+  });
+
+  it("净额为 0（已退干净）不列为异常", async () => {
+    mocks.activation.findMany.mockResolvedValue([
+      {
+        id: "act-y",
+        grizzlyId: "gy",
+        service: "wa",
+        country: "12",
+        phone: "18048093684",
+        status: "cancelled",
+        costUsd: "0.12",
+        reservedUsd: "0.12",
+        createdAt: new Date(Date.now() - 30 * 60_000),
+        key: { codePrefix: "GS-BBBB" },
+      },
+    ]);
+    mocks.keyLedger.findMany.mockResolvedValue([{ deltaUsd: "-0.12" }, { deltaUsd: "0.12" }]);
+
+    const r = await auditUnrefundedActivations();
+
+    expect(r.suspicious.length).toBe(0);
+    expect(r.totalOwedUsd).toBe("0.0000");
   });
 });

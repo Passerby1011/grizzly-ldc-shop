@@ -199,8 +199,31 @@ export async function loadCardKey(keyId: string): Promise<CardKeySummary | null>
 }
 
 /** 卡密是否还能用（active 且未过期）。 */
+/**
+ * 卡密能否**取号**（消耗余额）。
+ *
+ * 要求 status = active。余额扣到 0 时 ledger 会把状态改成 depleted，
+ * 此时不能再取号 —— 但**仍应能登录**（见 canLogin），否则用户无法充钱自救。
+ */
 export function isKeyUsable(key: { status: string; expiresAt: Date | null }): boolean {
   if (key.status !== "active") return false;
+  if (key.expiresAt && key.expiresAt.getTime() <= Date.now()) return false;
+  return true;
+}
+
+/**
+ * 卡密能否**登录**（进接码台看余额 / 历史 / 充值）。
+ *
+ * 比 isKeyUsable 宽：depleted（余额用光）也放行。
+ *
+ * 为什么必须这样：以前登录判据直接用了 isKeyUsable，于是余额扣到 0 的瞬间
+ * 状态变 depleted → 登录被拒 → 而充值接口又要求先登录 → 用户被锁在门外，
+ * 想充钱都进不来。这是死路，必须留出自救通道。
+ *
+ * 只有 revoked（作废）和已过期才真正禁止登录。
+ */
+export function canLogin(key: { status: string; expiresAt: Date | null }): boolean {
+  if (key.status === "revoked") return false;
   if (key.expiresAt && key.expiresAt.getTime() <= Date.now()) return false;
   return true;
 }
@@ -236,7 +259,13 @@ export async function startActivation(input: StartActivationInput): Promise<Star
 
   const key = await prisma.cardKey.findUnique({ where: { id: input.keyId } });
   if (!key) throw notFound("卡密不存在");
-  if (!isKeyUsable(key)) throw forbidden("卡密不可用（已过期或已失效）");
+  if (!isKeyUsable(key)) {
+    /* 区分"没钱"和"卡坏了"：前者能让用户自己充钱解决，别让他一脸懵 */
+    if (key.status === "depleted") {
+      throw forbidden("卡密余额已用完，请先充值再取号");
+    }
+    throw forbidden("卡密不可用（已过期或已失效）");
+  }
 
   const quote = input.priceUsd
     ? { service: input.service, country: input.country, priceUsd: dec(input.priceUsd), source: "override" as const }
@@ -983,9 +1012,20 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
     let state: ParsedStatus;
     try {
       state = await grizzly.getStatus(activation.grizzlyId);
-    } catch {
-      result.errors += 1;
-      continue;
+    } catch (error) {
+      /*
+       * 上游说"没有这个激活"（NO_ACTIVATION）→ 号已经没了，永远不可能再出码。
+       * 这种情况按已取消处理并退款；否则这一笔会永远卡在 waiting，
+       * 每轮核账都抛错跳过，买家的钱再也没人管。
+       *
+       * 其它错误（网络抖动、上游 5xx）才计入 errors 留待下轮重试。
+       */
+      if (error instanceof GrizzlyApiError && error.code === "NO_ACTIVATION") {
+        state = { state: "CANCEL" } as ParsedStatus;
+      } else {
+        result.errors += 1;
+        continue;
+      }
     }
 
     /* 上游其实已经出码了 → 补记，绝不让买家的码丢掉 */
@@ -1029,6 +1069,76 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
     console.log("[reconcile-abandoned]", JSON.stringify(result));
   }
   return result;
+}
+
+/**
+ * 审计：找出「扣了费但没退钱」的激活。
+ *
+ * 这是老板要的"自动复核装置"的**只读那半边** —— 核账负责自动补退，
+ * 这里负责把仍然对不上的挂到后台台面上，避免"没人看就永远没人管"。
+ *
+ * 判据：该激活关联的流水净额 < 0（钱出去了没回来）且激活没有成功出码。
+ *   · status = cancelled/expired → 本该全额退回，净额应为 0
+ *   · status = waiting 且已超过 graceMinutes → 监管缺失，应当已被核账收口
+ *   · status = ok → 买家拿到码了，扣费天经地义，不算欠款
+ *
+ * 返回的是"需要人工看一眼"的清单，不自动改账（自动退款在核账里做）。
+ */
+export async function auditUnrefundedActivations(graceMinutes = 60): Promise<{
+  graceMinutes: number;
+  suspicious: Array<{
+    activationId: string;
+    keyPrefix: string;
+    grizzlyId: string;
+    service: string;
+    country: string;
+    phone: string;
+    status: string;
+    costUsd: string;
+    netUsd: string;
+    owedUsd: string;
+    ageMinutes: number;
+  }>;
+  totalOwedUsd: string;
+}> {
+  const prisma = getPrisma();
+  const cutoff = new Date(Date.now() - graceMinutes * 60_000);
+
+  const acts = await prisma.activation.findMany({
+    where: {
+      status: { in: ["cancelled", "expired", "waiting"] },
+      OR: [{ status: { in: ["cancelled", "expired"] } }, { createdAt: { lt: cutoff } }],
+    },
+    orderBy: { createdAt: "asc" },
+    take: 200,
+    include: { key: { select: { codePrefix: true } } },
+  });
+
+  const suspicious: Awaited<ReturnType<typeof auditUnrefundedActivations>>["suspicious"] = [];
+  let totalOwed = dec(0);
+
+  for (const a of acts) {
+    const rows = await prisma.keyLedger.findMany({ where: { refId: a.id } });
+    const net = rows.reduce((acc, r) => acc.plus(dec(r.deltaUsd.toString())), dec(0));
+    /* 净额 >= 0 说明钱没亏在这个号上 */
+    if (net.gte(0)) continue;
+    suspicious.push({
+      activationId: a.id,
+      keyPrefix: a.key.codePrefix,
+      grizzlyId: a.grizzlyId,
+      service: a.service,
+      country: a.country,
+      phone: a.phone,
+      status: a.status,
+      costUsd: (a.costUsd ?? a.reservedUsd).toString(),
+      netUsd: net.toFixed(4),
+      owedUsd: net.negated().toFixed(4),
+      ageMinutes: Math.floor((Date.now() - a.createdAt.getTime()) / 60_000),
+    });
+    totalOwed = totalOwed.plus(net.negated());
+  }
+
+  return { graceMinutes, suspicious, totalOwedUsd: totalOwed.toFixed(4) };
 }
 
 export async function sweepStaleActivations(limit = 20): Promise<SweepResult> {

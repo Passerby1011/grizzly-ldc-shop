@@ -3,7 +3,7 @@ import { notFound, jsonOk, readJsonBody, withRoute, appendSessionCookie, forbidd
 import { getPrisma } from "@/lib/db";
 import { hashCode, maskCode, normalizeCode } from "@/lib/keycodec";
 import { dec } from "@/lib/money";
-import { isKeyUsable } from "@/lib/service";
+import { canLogin } from "@/lib/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,7 +18,12 @@ export const POST = withRoute(async (request: Request) => {
 
   const key = await getPrisma().cardKey.findUnique({ where: { codeHash: hashCode(normalized) } });
   if (!key) throw notFound("卡密不存在");
-  if (!isKeyUsable(key)) throw forbidden("卡密已过期或已失效");
+  /*
+   * 用 canLogin 而不是 isKeyUsable：余额为 0（depleted）的卡也要能进来 ——
+   * 否则用户余额花完就再也登不进来，连"给这张卡充值"都做不到。
+   * 能不能取号是另一回事，由 isKeyUsable 在取号时把关。
+   */
+  if (!canLogin(key)) throw forbidden("卡密已作废或已过期");
 
   const headers = new Headers();
   appendSessionCookie(headers, key.id);

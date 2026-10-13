@@ -84,8 +84,12 @@ export interface MeView {
     balanceUsd: string;
     status: string;
     expiresAt: string | null;
-    /** 是否仍可用（过期/作废的卡不能再取号） */
+    /** 能否取号（余额为 0 时 false） */
     usable?: boolean;
+    /** 能否登录（depleted 也算 true —— 得让用户进来充钱） */
+    loginable?: boolean;
+    /** 余额是否为 0 */
+    depleted?: boolean;
   } | null;
   /** 该卡密的取号历史（倒序）。刷新页面后靠它恢复"我用过什么"。 */
   activations: Array<{

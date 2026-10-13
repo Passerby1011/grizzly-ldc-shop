@@ -21,6 +21,24 @@ export interface OverviewView {
     paidFaceUsd: string;
   };
   activations: { byStatus: Record<string, number>; total: number };
+  /** 未退款审计：扣了费但没退钱的激活（核账跑完仍对不上的） */
+  unrefunded: {
+    count: number;
+    totalOwedUsd: string;
+    items: Array<{
+      activationId: string;
+      keyPrefix: string;
+      grizzlyId: string;
+      service: string;
+      country: string;
+      phone: string;
+      status: string;
+      costUsd: string;
+      netUsd: string;
+      owedUsd: string;
+      ageMinutes: number;
+    }>;
+  };
   lastReconcile: {
     ok: boolean;
     realUsd: string;

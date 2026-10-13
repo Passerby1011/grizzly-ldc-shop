@@ -549,6 +549,30 @@ export default function ShopPage() {
         </section>
       ) : null}
 
+      {/*
+        余额用完（depleted）的卡密**仍然可以登录**：这是有意的 ——
+        否则用户花完余额就再也进不来，连充值都做不到。
+        这里给一条明确的出路，而不是让他对着"卡密已失效"发懵。
+      */}
+      {session && (me?.key?.depleted || session.status === "depleted") ? (
+        <section
+          className="card space-y-2"
+          style={{
+            borderColor: "rgb(var(--warn) / 0.45)",
+            background: "rgb(var(--warn) / 0.08)",
+          }}
+          role="alert"
+        >
+          <h2 className="text-sm font-semibold" style={{ color: "rgb(var(--warn))" }}>
+            这张卡密的余额已用完
+          </h2>
+          <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--fg-muted))" }}>
+            余额为 0 时不能取号，但登录和查看历史不受影响。
+            用下方「+ 给这张卡充值」充一笔即可继续使用（充值到账后状态会自动恢复）。
+          </p>
+        </section>
+      ) : null}
+
       {!session ? (
         <section className="card card-lit space-y-3">
           <h2 className="flex items-center gap-2 text-sm font-semibold">

@@ -451,6 +451,37 @@ function KeysTab() {
     }
   }
 
+  /**
+   * 手动调整卡密额度。
+   *
+   * 走 /api/admin/keys/action 的 adjust 分支，服务端用 ledger.manualAdjust
+   * 写一条 reason="manual" 的流水 —— 这样余额变化有据可查，而且对账等式
+   * 本来就会减去 manual 合计，不会凭空报差额。
+   * 正数加、负数减，最多两位小数，单次上限 1000 USD。
+   */
+  async function adjust(id: string, codePrefix: string, current: string) {
+    const input = window.prompt(
+      `调整卡密 ${codePrefix} 的额度\n当前余额：${current} USD\n\n输入带符号的金额（如 0.5 表示加 0.5，-0.2 表示减 0.2）：`,
+      "",
+    );
+    if (input === null) return;
+    const trimmed = input.trim();
+    if (!trimmed) return;
+
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await adminPost<{ deltaUsd: string; balanceUsd: string; notice: string }>(
+        "/api/admin/keys/action",
+        { id, action: "adjust", amountUsd: trimmed },
+      );
+      setNotice(result.notice);
+      await load(page, statusFilter);
+    } catch (caught) {
+      setError(adminError(caught));
+    }
+  }
+
   return (
     <div className="space-y-4">
       {error ? <Alert>{error}</Alert> : null}
@@ -556,15 +587,25 @@ function KeysTab() {
                       <td className="faint">{k.outTradeNo ? `订单 ${k.outTradeNo.slice(0, 12)}…` : "后台生成"}</td>
                       <td className="faint">{shortTime(k.createdAt)}</td>
                       <td>
-                        {k.status === "revoked" ? (
-                          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void act(k.id, "restore")}>
-                            恢复
+                        <div className="flex flex-wrap gap-2">
+                          {/* 手动调额度：客服补偿/纠正错账用，写 manual 流水，对账不产生假差额 */}
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => void adjust(k.id, k.codePrefix, String(k.balanceUsd))}
+                          >
+                            调整额度
                           </button>
-                        ) : (
-                          <button type="button" className="btn btn-danger btn-sm" onClick={() => void act(k.id, "revoke")}>
-                            作废
-                          </button>
-                        )}
+                          {k.status === "revoked" ? (
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={() => void act(k.id, "restore")}>
+                              恢复
+                            </button>
+                          ) : (
+                            <button type="button" className="btn btn-danger btn-sm" onClick={() => void act(k.id, "revoke")}>
+                              作废
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -874,6 +915,58 @@ function OverviewTab({ refreshKey }: { refreshKey: number }) {
               净消耗 ${data.ledger.netConsumedUsd} · 手工 ${data.ledger.manualAdjustedUsd} · 卡密 {data.cards.total} 张 · 订单 {data.orders.total} 单（已付{" "}
               {data.orders.paidAmountLdc} LDC / ${data.orders.paidFaceUsd}）· 激活 {data.activations.total} 次
             </p>
+            {/*
+              未退款审计：扣了费但没退钱的激活。
+              核账会自动补退能自动退的，这里显示的是"补退之后仍然对不上"的，
+              count = 0 才是健康状态。
+            */}
+            {data.unrefunded && data.unrefunded.count > 0 ? (
+              <div
+                className="space-y-2 rounded-lg p-3"
+                style={{
+                  border: "1px solid rgb(var(--danger) / 0.4)",
+                  background: "rgb(var(--danger) / 0.07)",
+                }}
+                role="alert"
+              >
+                <h3 className="text-sm font-medium" style={{ color: "rgb(var(--danger))" }}>
+                  有 {data.unrefunded.count} 笔激活扣了费没退款（合计 ${data.unrefunded.totalOwedUsd}）
+                </h3>
+                <p className="text-xs leading-relaxed" style={{ color: "rgb(var(--fg-muted))" }}>
+                  这些是核账自动处理后仍未退干净的，请人工核对。
+                  可用上方「调整额度」给对应卡密手工补回。
+                </p>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="faint text-left">
+                      <th className="py-1 pr-2">卡密</th>
+                      <th className="py-1 pr-2">服务/国家</th>
+                      <th className="py-1 pr-2">号码</th>
+                      <th className="py-1 pr-2">状态</th>
+                      <th className="py-1 pr-2">欠款</th>
+                      <th className="py-1">已过</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.unrefunded.items.map((u) => (
+                      <tr key={u.activationId} style={{ borderTop: "1px solid rgb(var(--line) / 0.5)" }}>
+                        <td className="code-display py-1 pr-2">{u.keyPrefix}</td>
+                        <td className="py-1 pr-2">{u.service}/{u.country}</td>
+                        <td className="code-display py-1 pr-2">{u.phone}</td>
+                        <td className="py-1 pr-2">{u.status}</td>
+                        <td className="tnum py-1 pr-2" style={{ color: "rgb(var(--danger))" }}>
+                          ${u.owedUsd}
+                        </td>
+                        <td className="faint py-1">{u.ageMinutes} 分</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="faint text-xs">未退款审计：无异常（核账未发现扣费未退的激活）</p>
+            )}
+
             {data.lastReconcile ? (
               <p className="faint">
                 上次对账：{shortTime(data.lastReconcile.createdAt)} ·{" "}

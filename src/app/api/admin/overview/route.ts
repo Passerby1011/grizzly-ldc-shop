@@ -3,6 +3,7 @@ import { requireAdmin } from "@/lib/admin";
 import { getPrisma } from "@/lib/db";
 import { dec, formatUsd } from "@/lib/money";
 import { getConsumedUsd, getNetConsumedUsd, getManualAdjustedUsd, getPoolState } from "@/lib/pool";
+import { auditUnrefundedActivations } from "@/lib/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,7 @@ export const GET = withRoute(async (request: Request) => {
   requireAdmin(request);
   const prisma = getPrisma();
 
+  const audit = await auditUnrefundedActivations();
   const [pool, consumed, netConsumed, manualAdjusted, keyGroups, orderGroups, activationGroups, paidOrders, recentOrders, recentActivations, lastRun, lastSnapshot] =
     await Promise.all([
       getPoolState(),
@@ -66,6 +68,15 @@ export const GET = withRoute(async (request: Request) => {
     activations: {
       byStatus: activationCounts,
       total: Object.values(activationCounts).reduce((sum, value) => sum + value, 0),
+    },
+    /*
+     * 未退款审计（只读）：扣了费但没退钱的激活。
+     * 核账会自动补退，这里把"核账没解决的"摆上台面，避免没人看就没人管。
+     */
+    unrefunded: {
+      count: audit.suspicious.length,
+      totalOwedUsd: audit.totalOwedUsd,
+      items: audit.suspicious.slice(0, 10),
     },
     lastReconcile: lastRun
       ? {
