@@ -202,7 +202,7 @@ describe("充值必须同时累加面值", () => {
   /*
    * 回归：曾经只加 balanceUsd、不加 faceUsd。
    * 实测 GS-XWT9：买卡 $0.15 + 充值 $0.12，面值却一直显示 $0.15，
-   * 后台看不出这张卡的真实体量（老板就是因此以为充值没到账）。
+   * 后台看不出这张卡的真实体量（维护者就是因此以为充值没到账）。
    */
   it("给目标卡密的 faceUsd 做原子 increment", async () => {
     mocks.state.order = orderRow();

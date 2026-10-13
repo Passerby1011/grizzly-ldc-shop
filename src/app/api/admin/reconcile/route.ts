@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
  *   应有余额 = 基准投入 − 净消耗 − 手工调整
  *   差额     = 真实余额 − 应有余额
  *
- * 只有「我们不知道的上游变动」（老板手动给 Grizzly 充值 / 直接在上游消费）
+ * 只有「我们不知道的上游变动」（人工给 Grizzly 充值 / 直接在上游消费）
  * 才会产生差额。发卡、充值入账、作废卡密都是纯本地动作，不会造成差额。
  */
 export const POST = withRoute(async (request: Request) => {

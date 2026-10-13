@@ -27,7 +27,7 @@ export const GET = withRoute(async (request: Request) => {
    *   sweep    —— 主动回收「超时还没收到码」的号，释放上游库存（不退卡密余额）
    *   reconcile —— 核对被遗弃的 waiting：上游出码就补记、上游取消就退款
    *
-   * 前者受 autoCancelMinutes 开关控制（老板当前设为关闭），后者是资金安全，
+   * 前者受 autoCancelMinutes 开关控制（维护者当前设为关闭），后者是资金安全，
    * 独立于开关、始终执行。
    */
   const result = await sweepStaleActivations();

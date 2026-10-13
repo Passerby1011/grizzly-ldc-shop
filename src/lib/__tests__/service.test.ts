@@ -431,7 +431,7 @@ describe("超时回收：按号龄判定，不依赖定时器与巡检频率", (
 
   it("默认关闭（0），启用时的值必须显著小于上游 20 分钟红线", () => {
     const view = getEnvFallbackSettings();
-    /* 老板 2026-10-11 决定先不启用，默认 0 = 关闭 */
+    /* 维护者 2026-10-11 决定先不启用，默认 0 = 关闭 */
     expect(view.autoCancelMinutes).toBe(0);
     /* 若将来启用，18 以内才安全（上游 20 分钟硬截止） */
     expect(view.autoCancelMinutes).toBeLessThanOrEqual(18);
@@ -458,7 +458,7 @@ describe("reconcileAbandonedActivations：弃单核账（资金安全，独立�
    * waiting，而上游早已出码或取消。实测 wa/151 那笔 $0.12 卡了一整天。
    */
 
-  it("上游已取消 + 过了确认窗口 → 退款给卡密（老板定的口径）", async () => {
+  it("上游已取消 + 过了确认窗口 → 退款给卡密（既定口径）", async () => {
     mocks.activation.findMany.mockResolvedValue([
       activationRow({ createdAt: new Date(Date.now() - 30 * 60_000), costUsd: "0.12" }),
     ]);

@@ -56,7 +56,7 @@ function shortTime(iso: string): string {
  * 卡密使用历史：取号记录 + 资金流水。
  *
  * 为什么要有：以前买家刷新页面就什么都看不到了，连"我这张卡花过哪些钱"
- * 都查无对证（老板 2026-10-11 明确要求可见）。数据全部来自
+ * 都查无对证（维护者 2026-10-11 明确要求可见）。数据全部来自
  * GET /api/me/activations，按 HttpOnly Cookie 会话取，不依赖任何前端状态。
  */
 export function UsageHistory({ me, onRefresh }: { me: MeView | null; onRefresh: () => void }) {

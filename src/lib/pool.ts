@@ -454,7 +454,7 @@ export interface ReconcileResult {
  *
  * 与旧的 computeLedgerUsd 的关键区别：旧口径把「已售未消耗」当资产加进来，
  * 而作废/恢复卡密只改本地状态、不碰上游，却会改变「已售未消耗」——
- * 于是老板手动作废一张卡，对账就凭空差出一个卡片余额（实测差 1.74）。
+ * 于是人工作废一张卡，对账就凭空差出一个卡片余额（实测差 1.74）。
  * 那是错误的等式，不是真的漂移。
  *
  * 进等式的只有：
@@ -508,7 +508,7 @@ export async function ensureReconcileBaseline(
   /*
    * 首次推断：假设此刻余额全部来自初始投入减去已发生的消耗，
    * 即 baseline = 当前余额 + 净消耗。这是**无漂移假设**下的自洽解，
-   * 用于给老板一个起点，之后差额会诚实地显现出来。
+   * 用于给维护者一个起点，之后差额会诚实地显现出来。
    */
   const consumed = await getNetConsumedUsd(prisma);
   const baseline = dec(realBalanceUsd).plus(consumed);
@@ -534,7 +534,7 @@ export async function ensureReconcileBaseline(
  *   应有余额 = 基准投入 − 净消耗
  *   差额     = 真实余额 − 应有余额
  *
- * 差额只可能来自**我们不知道的上游变动**：老板手动给 Grizzly 充值、
+ * 差额只可能来自**我们不知道的上游变动**：人工给 Grizzly 充值、
  * 或直接在上游买了东西。作废/发卡/充值入账都不会造成差额。
  * 核对无误后点「校准」把差额并入基准即可归零。
  */
@@ -549,7 +549,7 @@ export async function runReconcile(
   const { baselineUsd } = await ensureReconcileBaseline(pool.realBalanceUsd);
 
   /* 手工调整不改变上游，但它确实动了卡密余额，所以从应有余额里扣掉，
-     避免老板手动加过钱之后被误判成漂移 */
+     避免人工加过钱之后被误判成漂移 */
   const expectedUsd = baselineUsd.minus(netConsumed).minus(manualAdjusted);
   const drift = pool.realBalanceUsd.minus(expectedUsd);
   const ok = drift.abs().lte(dec(RECONCILE_TOLERANCE_USD));
@@ -596,7 +596,7 @@ export async function runReconcile(
 /**
  * 校准：把当前差额并入基准，使对账归零。
  *
- * 用途：老板手动给 Grizzly 充过值 / 在上游买过东西后，差额是**真实且合理**的，
+ * 用途：人工给 Grizzly 充过值 / 在上游买过东西后，差额是**真实且合理**的，
  * 记下来即可。校准不修改任何卡密余额与流水，只调整基准这一个数。
  */
 export async function calibrateBaseline(): Promise<{ baselineUsd: string; driftBefore: string }> {

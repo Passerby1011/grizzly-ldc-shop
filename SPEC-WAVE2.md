@@ -3,9 +3,9 @@
 > 唯一实现依据。上游事实均为 2026-10-10 实测，勿改。
 > Wave 1（取消倒计时 / 自动估价 / 错误码中文化 / service-names 骨架）**已完成并验收通过**（127 测试全绿），本轮在其之上继续。
 
-## 背景：老板的 5 条反馈与本轮的对应关系
+## 背景：维护者的 5 条反馈与本轮的对应关系
 
-| 老板原话 | 本轮做什么 |
+| 维护者原话 | 本轮做什么 |
 |---|---|
 | 1. Grizzly 没有中文，照搬它网页上的 | 用实测 code→中文名词典（`service-names.zh.ts` 扩充） |
 | 2. 后台没有管理卡密的功能 | 新增卡密管理（生成/列表/作废/导出） |
@@ -14,7 +14,7 @@
 | 5. 锁定时长可以后台自定义 | 同一个设置面板 |
 
 **关键设计决定：4 和 5 必须落库到 `Setting` 表并优先于环境变量。**
-理由：Vercel 上改环境变量要重新部署；老板要的是「在后台点一下就能改」。
+理由：Vercel 上改环境变量要重新部署；维护者要的是「在后台点一下就能改」。
 读取优先级必须是 **DB 设置 > 环境变量 > 硬编码默认值**。
 
 ## 一、数据模型（`prisma/schema.prisma` 新增）
@@ -50,7 +50,7 @@ export async function updateSiteSettings(patch: Partial<...>): Promise<SiteSetti
 **必须通知调用方改这里**：`createPayOrder` 的汇率来源、`pool.ts` 的 `safety_buffer`、`service.ts` 的 `cancelLockSeconds`、首页面值，
 全部从 `getSiteSettings()` 取，不要再直接读 `getConfig()` 的这几个字段。
 
-## 二、服务中文名（老板第 1 条）——用实测数据填
+## 二、服务中文名（维护者第 1 条）——用实测数据填
 
 **已实测的 Grizzly `getServicesList` 真实 code**（2026-10-10，共 2488 个服务）：
 
@@ -95,7 +95,7 @@ export async function updateSiteSettings(patch: Partial<...>): Promise<SiteSetti
 > 允许我在数据文件里补更全的词典，但实现必须保证上面 4 条兜底语义。
 > 词典的权威来源已抓取并解析过，可参考 `data/service-names.zh.json`（若为空可忽略），真实 code 以上表为准。
 
-## 三、后台（老板第 2/4/5 条）
+## 三、后台（维护者第 2/4/5 条）
 
 ### API（全部要求 `Authorization: Bearer <ADMIN_TOKEN>`）
 | 路由 | 方法 | 说明 |
@@ -124,9 +124,9 @@ export async function updateSiteSettings(patch: Partial<...>): Promise<SiteSetti
   3. **订单 / 激活**：分页表格，状态用彩色徽标。
   4. **对账**：余额/池/可用 三个数字 + 最近对账记录 + 「立即对账」按钮。
 
-## 四、UI 重做（老板第 3 条）
+## 四、UI 重做（维护者第 3 条）
 
-**目标：从"能用"变成"好看"。老板明确说过审美他自己不怎么挑，要你自主决定，所以不要来回问，直接做到位。**
+**目标：从"能用"变成"好看"。维护者明确说过审美他自己不怎么挑，要你自主决定，所以不要来回问，直接做到位。**
 
 技术约束（**必须遵守，勿引入新依赖**）：
 - 只用现有 `tailwindcss` + 原生 CSS。**不要**装 shadcn/radix/headless-ui 等新包。
@@ -179,5 +179,5 @@ npm run build
 1. 三个门禁真实输出
 2. 改动/新增文件清单
 3. `GET /api/admin/settings` 的响应 JSON 形状（**示例值可假，但键名必须真实**）
-4. 术语对照：老板 5 条反馈各自对应的落点
+4. 术语对照：维护者 5 条反馈各自对应的落点
 5. **仍未验证的点**（如实说，尤其 UI 未在浏览器手工走查这一点）

@@ -952,7 +952,7 @@ export async function maybeReconcileAbandoned(): Promise<Awaited<ReturnType<type
  * 为什么要有：上游取消窗口实测在 64s～334s 之间浮动。号码一直挂着不但白占
  * 供应商库存，还可能拉低账号质量；实测 ACCESS_CANCEL 会把号码费用退回主账号。
  *
- * 计费口径（老板定的规则）：**取消成功也不退还卡密余额** —— 号码已被消耗，
+ * 计费口径（维护者定的规则）：**取消成功也不退还卡密余额** —— 号码已被消耗，
  * 买家承担未收到码的风险。因此这里只改状态、只释放上游，**不写任何 ledger**。
  *
  * 幂等：本地用条件 UPDATE 抢占（waiting → expired），重复跑不会重复处理。
@@ -1024,7 +1024,7 @@ async function recycleOneActivation(activationId: string): Promise<"recycled" | 
  * 永远冻在 waiting。而上游那边早就出了码、或者自己取消了（ACCESS_CANCEL
  * 把钱退回主账号）。这些钱就白白卡在激活记录里，谁也不知道。
  *
- * 实测（2026-10-11，老板发现）：wa/151 那笔 $0.12 卡了一整天，上游状态
+ * 实测（2026-10-11，实测发现）：wa/151 那笔 $0.12 卡了一整天，上游状态
  * STATUS_CANCEL、上游余额只少了成功那笔的 $0.15，但本地一直是 waiting。
  *
  * 与 sweepStaleActivations 的区别（**计费口径完全相反，别混**）：
@@ -1033,7 +1033,7 @@ async function recycleOneActivation(activationId: string): Promise<"recycled" | 
  *
  * 触发方式：/api/cron/sweep（外部定时器，配 CONFIRM_CANCEL_MINUTES）+
  * 轮询接口机会式兜底。做成「按上游实际状态收口」而不是「按超时时间猜」，
- * 所以独立于 autoCancelMinutes 开关 —— 老板可以关掉主动回收，但弃单核账
+ * 所以独立于 autoCancelMinutes 开关 —— 维护者可以关掉主动回收，但弃单核账
  * 属于资金安全，必须常开。
  *
  * 安全闸门：只有当「上游已经取消 且 取号后已超过 confirmCancelMinutes」时才退款。
@@ -1147,7 +1147,7 @@ export async function reconcileAbandonedActivations(limit = 20): Promise<{
 /**
  * 审计：找出「扣了费但没退钱」的激活。
  *
- * 这是老板要的"自动复核装置"的**只读那半边** —— 核账负责自动补退，
+ * 这是维护者要的"自动复核装置"的**只读那半边** —— 核账负责自动补退，
  * 这里负责把仍然对不上的挂到后台台面上，避免"没人看就永远没人管"。
  *
  * 判据：该激活关联的流水净额 < 0（钱出去了没回来）且激活没有成功出码。
