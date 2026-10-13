@@ -67,7 +67,7 @@ src/lib/                       核心库（全部可在 vitest 里单测）
   pool.ts        池核算 + 发卡 + 回调发货（fulfillPaidOrder）+ 对账
   face-value.ts  面值/充值金额规则（唯一校验入口）
   settings.ts    站点设置：DB > 环境变量 > 默认（单一键映射表）
-  idempotency.ts 幂等键 + 内存锁 / 可选 Upstash 锁
+  idempotency.ts 幂等键 + 锁工具（**当前未被业务调用**，见「已知缺口」）
   http.ts        统一 JSON 响应、错误码、请求体校验、会话 Cookie
   db.ts          PrismaClient 单例
   service.ts     业务编排：下单 / 取号 / 轮询 / 取消 / 核账 / 审计
@@ -207,11 +207,22 @@ DATABASE_URL="<neon-url>" npx prisma db push
 > 注意对账有降级容错，可能「看起来正常」（返回推算值），
 > 所以判断库结构要用 `overview`，不要用对账。
 
-### 2. Redis（Upstash，可选但推荐）
+### 2. Redis（Upstash）—— 当前**不需要配**
 
-配了 `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` 后，
-`src/lib/idempotency.ts` 会把锁从「进程内」升级成「跨实例 Redis 锁」；
-不配则退化为内存锁（单实例部署够用，账本原子扣费不受影响）。
+> ⚠️ 说明：仓库里 `src/lib/idempotency.ts` 提供了内存锁与 Upstash 跨实例锁的实现，
+> 但**业务代码目前没有调用它**（幂等是靠数据库层的条件 UPDATE 与唯一约束保证的，
+> 见「资金安全设计」）。因此配 `UPSTASH_REDIS_REST_*` 目前**不会产生任何效果**。
+>
+> 保留这份实现是为了将来需要跨实例互斥时可以直接接入；
+> 如果你不打算用，删掉该文件与这两个环境变量不影响任何功能。
+
+**实际上，本项目的并发安全完全由数据库保证**，单实例或多实例部署都成立：
+
+- 扣费：原子条件 UPDATE（余额不足直接 0 行返回）
+- 取消/退款：条件 UPDATE 抢占，重复调用只退一次
+- 发卡/充值入账：事务内条件更新 + 唯一约束
+
+所以**不需要 Redis 也能正确运行**。
 
 ### 3. 导入仓库到 Vercel
 
@@ -228,7 +239,7 @@ Production / Preview 都要配：
 | `LDC_PID` / `LDC_KEY` | LINUX DO Credit 商户号与密钥 |
 | `LDC_API_BASE` | 默认 `https://credit.linux.do/epay` |
 | `DATABASE_URL` | Neon 连接串 |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | 可选，配了就启用 Redis 锁 |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | **当前无效果**（见上节说明），不配即可 |
 | `ADMIN_TOKEN` | 管理台口令（长随机串） |
 | `RATE_LDC_PER_USD` | 1 美元 Grizzly 余额卖多少 LDC |
 | `MARKUP_PCT` | 附加毛利百分比，叠加在汇率之上 |
@@ -412,8 +423,11 @@ npm test
 5. **LDC 退款接口未接入业务。** `ldc.ts` 有 `refund` 能力，但没有任何业务路径调用它；
    目前所有退款都发生在**内部余额**层面，不涉及把 LDC 退回买家。
 6. **管理登录限速是单实例内存的**，多实例部署下会被绕过。
-   配了 Upstash 可以加强，但不是内置行为。
-7. 对账容差 1 分钱；更大漂移只写记录 + 日志告警，不会自动改账。
+7. **`src/lib/idempotency.ts` 当前是未被调用的实现（约 190 行）。**
+   它在设计上提供进程内锁与 Upstash 跨实例锁，但业务路径没有接入 ——
+   现有的并发安全由数据库层的条件 UPDATE 与唯一约束保证，不依赖它。
+   保留是为了将来需要跨实例互斥时可直接启用。
+8. 对账容差 1 分钱；更大漂移只写记录 + 日志告警，不会自动改账。
 
 ---
 
